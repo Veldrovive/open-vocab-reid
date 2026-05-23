@@ -1,4 +1,6 @@
 dat/
+wandb/
+weights/
 
 # Python-generated files
 __pycache__/
