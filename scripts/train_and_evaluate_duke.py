@@ -17,14 +17,16 @@ import matplotlib.pyplot as plt
 import wandb
 
 # Import project utilities and dataset classes
-from open_vocab_mot.data import (
-    DukeMTMCItemBatch,
+from open_vocab_mot.data.duke_mtmc_video_ds import (
     DukeMTMCVideoDataset,
-    collate_duke_mtmc_video_ds,
-    DukeMTMCVideoDatasetVideoKPFBatchSampler,
     DukeSplit,
     DukeCameraId,
     DukePersonId
+)
+from open_vocab_mot.data.video_reid_abc import (
+    VideoReIDBatch,
+    collate_video_reid_ds,
+    VideoReIDKPFBatchSampler
 )
 from open_vocab_mot.definitions import DUKEMTMC_VIDEO_REID_PATH, DUKEMTMC_VIDEO_REID_SIDECAR_PATH
 from aidan_lib.models.dino_lib_compiled import DINOv3CompiledHarness
@@ -50,7 +52,7 @@ def process_duke_ds(
         ds,
         batch_size=batch_size,
         shuffle=False,
-        collate_fn=collate_duke_mtmc_video_ds,
+        collate_fn=collate_video_reid_ds,
         pin_memory=True,
         num_workers=8
     )
@@ -70,24 +72,43 @@ def process_duke_ds(
 
     progress = tqdm(loader, desc="Processing Frames")
     frame_count = 0
-    batch: DukeMTMCItemBatch
+    batch: VideoReIDBatch
     for batch in progress:
         progress.set_description_str("Running DINO")
-        imgs_torch = [e.to(device) for e in batch.frame_tensors]
-        if dino_batch_split > 1:
-            dino_embeddings = []
-            for i in range(dino_batch_split):
-                start_idx = i * len(imgs_torch) // dino_batch_split
-                end_idx = (i + 1) * len(imgs_torch) // dino_batch_split
-                if start_idx < end_idx:
-                    split_imgs = imgs_torch[start_idx:end_idx]
-                    split_segs = batch.segmentations[start_idx:end_idx]
-                    dino_embeddings.extend(dino_harness.match_bool_segmentations_to_dino(split_imgs, split_segs))
-        else:
-            dino_embeddings = dino_harness.match_bool_segmentations_to_dino(imgs_torch, batch.segmentations)
+        valid_imgs = []
+        valid_segs = []
+        valid_indices = []
+        
+        for idx, (img, seg) in enumerate(zip(batch.frame_tensors, batch.segmentations)):
+            if seg is not None:
+                valid_imgs.append(img)
+                valid_segs.append(seg)
+                valid_indices.append(idx)
+
+        dino_embeddings = [[] for _ in range(len(batch.frame_tensors))]
+        
+        if len(valid_imgs) > 0:
+            if dino_batch_split > 1:
+                valid_embs = []
+                num_valid = len(valid_imgs)
+                for i in range(dino_batch_split):
+                    start_idx = i * num_valid // dino_batch_split
+                    end_idx = (i + 1) * num_valid // dino_batch_split
+                    if start_idx < end_idx:
+                        split_imgs = [e.to(device) for e in valid_imgs[start_idx:end_idx]]
+                        split_segs = valid_segs[start_idx:end_idx]
+                        valid_embs.extend(dino_harness.match_bool_segmentations_to_dino(split_imgs, split_segs))
+                        del split_imgs
+            else:
+                imgs_torch = [e.to(device) for e in valid_imgs]
+                valid_embs = dino_harness.match_bool_segmentations_to_dino(imgs_torch, valid_segs)
+                del imgs_torch
+            
+            for valid_idx, emb in zip(valid_indices, valid_embs):
+                dino_embeddings[valid_idx] = emb
         
         progress.set_description_str("Extracting DINO embeddings")
-        person_ids, camera_ids = batch.person_ids, batch.camera_ids
+        person_ids, camera_ids = batch.identity_ids, batch.sequence_ids
         batch_frame_data = []
         dino_embedding_video: list[torch.Tensor] = []
         for person_id, camera_id, frame_dino_embedding in zip(person_ids, camera_ids, dino_embeddings):
@@ -434,14 +455,14 @@ def main():
     )
     
     print("Setting up Batch Sampler...")
-    train_sampler = DukeMTMCVideoDatasetVideoKPFBatchSampler(
+    train_sampler = VideoReIDKPFBatchSampler(
         train_ds,
         batches_per_epoch=args.batches_per_epoch,
-        num_people_per_batch=args.people_per_batch,
-        num_views_per_person=args.views_per_person,
-        num_frames_per_view=args.frames_per_video,
-        allow_same_person_same_view=True,
-        allow_reduced_views_per_person=False,
+        num_identities_per_batch=args.people_per_batch,
+        num_sequences_per_identity=args.views_per_person,
+        num_frames_per_sequence=args.frames_per_video,
+        allow_same_identity_same_sequence=True,
+        allow_reduced_sequences_per_identity=False,
         allow_resampling_sample_indices=True,
         epoch_deterministic=False,
         seed=args.seed,
@@ -450,7 +471,7 @@ def main():
     
     train_loader = DataLoader(
         dataset=train_ds,
-        collate_fn=collate_duke_mtmc_video_ds,
+        collate_fn=collate_video_reid_ds,
         batch_sampler=train_sampler,
         num_workers=8,
         pin_memory=True
@@ -496,37 +517,57 @@ def main():
         
         for batch_idx, batch in enumerate(progress):
             # 1. Extract DINO embeddings (Gradients disabled for DINO)
+            num_frames = len(batch.frame_tensors)
             with torch.no_grad():
-                imgs_torch = [e.to(device) for e in batch.frame_tensors]
-                if args.dino_batch_split > 1:
-                    dino_embeddings = []
-                    for i in range(args.dino_batch_split):
-                        start_idx = i * len(imgs_torch) // args.dino_batch_split
-                        end_idx = (i + 1) * len(imgs_torch) // args.dino_batch_split
-                        if start_idx < end_idx:
-                            split_imgs = imgs_torch[start_idx:end_idx]
-                            split_segs = batch.segmentations[start_idx:end_idx]
-                            dino_embeddings.extend(dino_harness.match_bool_segmentations_to_dino(split_imgs, split_segs))
-                else:
-                    dino_embeddings = dino_harness.match_bool_segmentations_to_dino(imgs_torch, batch.segmentations)
+                valid_imgs = []
+                valid_segs = []
+                valid_indices = []
+                
+                for idx, (img, seg) in enumerate(zip(batch.frame_tensors, batch.segmentations)):
+                    if seg is not None:
+                        valid_imgs.append(img)
+                        valid_segs.append(seg)
+                        valid_indices.append(idx)
+
+                dino_embeddings = [[] for _ in range(len(batch.frame_tensors))]
+                
+                if len(valid_imgs) > 0:
+                    if args.dino_batch_split > 1:
+                        valid_embs = []
+                        num_valid = len(valid_imgs)
+                        for i in range(args.dino_batch_split):
+                            start_idx = i * num_valid // args.dino_batch_split
+                            end_idx = (i + 1) * num_valid // args.dino_batch_split
+                            if start_idx < end_idx:
+                                split_imgs = [e.to(device) for e in valid_imgs[start_idx:end_idx]]
+                                split_segs = valid_segs[start_idx:end_idx]
+                                valid_embs.extend(dino_harness.match_bool_segmentations_to_dino(split_imgs, split_segs))
+                                del split_imgs
+                    else:
+                        imgs_torch = [e.to(device) for e in valid_imgs]
+                        valid_embs = dino_harness.match_bool_segmentations_to_dino(imgs_torch, valid_segs)
+                        del imgs_torch
+                    
+                    for valid_idx, emb in zip(valid_indices, valid_embs):
+                        dino_embeddings[valid_idx] = emb
                 
             # 2. Group embeddings by video (person_id, camera_id) and track person_ids
             video_indices: dict[tuple[int, int], int] = {}
             video_embeddings: list[list[torch.Tensor]] = []
             video_person_ids: list[int] = []
             
-            for sample_idx in range(len(batch.person_ids)):
+            for sample_idx in range(len(batch.identity_ids)):
                 # Skip frame if no segmentations/embeddings were found
                 if len(dino_embeddings[sample_idx]) == 0:
                     continue
                     
-                video_key = (int(batch.person_ids[sample_idx]), int(batch.camera_ids[sample_idx]))
+                video_key = (int(batch.identity_ids[sample_idx]), int(batch.sequence_ids[sample_idx]))
                 
                 if video_key not in video_indices:
                     video_index = len(video_embeddings)
                     video_embeddings.append([])
                     video_indices[video_key] = video_index
-                    video_person_ids.append(int(batch.person_ids[sample_idx]))
+                    video_person_ids.append(int(batch.identity_ids[sample_idx]))
                     
                 video_index = video_indices[video_key]
                 video_embeddings[video_index].append(

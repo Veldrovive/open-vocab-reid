@@ -2,36 +2,58 @@
 import os
 import sys
 import random
-import argparse
+import dataclasses
 from pathlib import Path
-from typing import TypedDict
+from typing import TypedDict, Optional
 from jaxtyping import Float
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset, ConcatDataset
 from torch.nn.utils.rnn import pad_sequence
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 import wandb
 
+import hydra
+from hydra.core.config_store import ConfigStore
+from omegaconf import DictConfig, OmegaConf
+from pydantic import Field, BaseModel
+
 from accelerate import Accelerator, DataLoaderConfiguration
 from accelerate.utils import gather_object
+from torch.utils.checkpoint import checkpoint
 
 # Import project utilities and dataset classes
+from open_vocab_mot.data.whale_ds import (
+    WhaleDataset,
+    WhaleSplit
+)
 from open_vocab_mot.data.duke_mtmc_video_ds import (
     DukeMTMCVideoDataset,
     DukeSplit,
     DukeCameraId,
     DukePersonId
 )
+from open_vocab_mot.data import (
+    Wildlife10KSubsetDataset,
+    Wildlife10KSplit,
+    Wildlife10KDatasets
+)
 from open_vocab_mot.data.video_reid_abc import (
     VideoReIDBatch,
     collate_video_reid_ds,
-    VideoReIDKPFBatchSampler
+    VideoReIDKPFBatchIterableDataset
 )
-from open_vocab_mot.definitions import DUKEMTMC_VIDEO_REID_PATH, DUKEMTMC_VIDEO_REID_SIDECAR_PATH
+from open_vocab_mot.definitions import (
+    DUKEMTMC_VIDEO_REID_PATH, 
+    DUKEMTMC_VIDEO_REID_SIDECAR_PATH,
+    WHALE_DATASET_PATH,
+    WHALE_DATASET_SIDECAR_PATH,
+    WILDLIFE_10K_PATH,
+    WILDLIFE_10K_SIDECAR_PATH
+)
 from aidan_lib.models.dino_lib_compiled import DINOv3CompiledHarness
 
 from open_vocab_mot.models import HierarchicalVideoReIDTransformer
@@ -39,8 +61,8 @@ from open_vocab_mot.losses import CircleLossWithUnknowns
 
 
 @torch.no_grad()
-def process_duke_ds(
-    ds: DukeMTMCVideoDataset,
+def process_val_ds(
+    ds: Dataset,
     model: HierarchicalVideoReIDTransformer,
     dino_harness: DINOv3CompiledHarness,
     accelerator: Accelerator,
@@ -48,7 +70,8 @@ def process_duke_ds(
     batch_size: int = 64,
     video_batch_size: int = 64,
     num_video_embeddings_per_video: int = 1,
-    dino_batch_split: int = 1
+    dino_batch_split: int = 1,
+    split_single_sequences: bool = False
 ):
     loader = DataLoader(
         ds,
@@ -183,7 +206,7 @@ def process_duke_ds(
     frame_data = all_frame_data
 
     # Map from person to camera to list of frame indices
-    frame_index_map: dict[DukePersonId, dict[DukeCameraId, list[int]]] = {}
+    frame_index_map: dict[int, dict[int, list[int]]] = {}
     for frame_idx, (person_id, camera_id) in enumerate(frame_data):
         if person_id not in frame_index_map:
             frame_index_map[person_id] = {}
@@ -194,6 +217,21 @@ def process_duke_ds(
 
         frame_list = camera_index_map[camera_id]
         frame_list.append(frame_idx)
+
+    # Split single sequences
+    if split_single_sequences:
+        for person_id, camera_index_map in list(frame_index_map.items()):
+            if len(camera_index_map) == 1:
+                camera_id = list(camera_index_map.keys())[0]
+                frame_indices = camera_index_map[camera_id]
+                
+                if len(frame_indices) >= 2:
+                    mid = len(frame_indices) // 2
+                    part1 = frame_indices[:mid]
+                    part2 = frame_indices[mid:]
+                    
+                    camera_index_map[camera_id] = part1
+                    camera_index_map[camera_id + 100000] = part2
 
     # Prepare tasks for video embeddings
     video_tasks = []
@@ -212,7 +250,7 @@ def process_duke_ds(
     else:
         local_tasks = video_tasks[start_idx:end_idx]
     
-    video_embedding_index_map: dict[DukePersonId, dict[DukeCameraId, list[int]]] = {}
+    video_embedding_index_map: dict[int, dict[int, list[int]]] = {}
     local_video_contrastive_embeddings = []
 
     rng = random.Random(42)
@@ -383,6 +421,8 @@ def evaluate_duke_reid(
         valid_queries_video += 1
         
         sorted_indices = torch.argsort(sims, descending=True)
+        if sims[sorted_indices[0]] > 0.999:
+            print(f"WARNING: q_idx={q_idx} has max sim {sims[sorted_indices[0]].item()} with idx={sorted_indices[0].item()}! Exact same embedding?")
         sorted_truth = truth_indices[sorted_indices]
         
         first_match_rank = torch.where(sorted_truth)[0][0].item()
@@ -462,74 +502,214 @@ def evaluate_duke_reid(
     }
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Train and evaluate Hierarchical Video ReID Transformer")
+@torch.no_grad()
+def evaluate_reid(
+    processed_val: dict,
+    num_embeddings_per_video: int = 1,
+    sim_aggregation: str = "max",
+    device: str = "cuda"
+):
+    val_embs, val_meta = group_embeddings(processed_val, num_embeddings_per_video)
     
-    # Training configurations
-    parser.add_argument("--epochs", type=int, default=3, help="Number of training epochs")
-    parser.add_argument("--batches-per-epoch", type=int, default=300, help="Number of batches per epoch")
-    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
-    parser.add_argument("--frame-loss-weight", type=float, default=0.85, help="Frame loss weight")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--dino-checkpoint", type=str, default="facebook/dinov3-vitl16-pretrain-lvd1689m", help="DINO checkpoint")
-    parser.add_argument("--dino-batch-split", type=int, default=1, help="Number of splits for the DINO embedding batch to save GPU memory")
+    val_embs = F.normalize(val_embs.to(device), p=2, dim=-1)
     
-    # Batch sampler configurations
-    parser.add_argument("--frames-per-video", type=int, default=16, help="Number of frames per video")
-    parser.add_argument("--people-per-batch", type=int, default=16, help="Number of people per batch")
-    parser.add_argument("--views-per-person", type=int, default=3, help="Number of views per person")
+    print("Computing embedding-level pairwise similarities...")
+    pairwise_sims = torch.einsum('qmd,gnd->qgmn', val_embs, val_embs)
     
-    # Hardware/Env settings
-    parser.add_argument("--device", type=str, default="cuda", help="Torch device to use (overridden by accelerate)")
-    parser.add_argument("--cuda-visible-devices", type=str, default=None, help="Force CUDA_VISIBLE_DEVICES env variable")
+    print(f"Aggregating video-to-video similarities using '{sim_aggregation}'...")
+    if sim_aggregation == "max":
+        video_sims = pairwise_sims.max(dim=-1)[0].max(dim=-1)[0]
+    elif sim_aggregation == "mean":
+        video_sims = pairwise_sims.mean(dim=(-2, -1))
+    else:
+        raise ValueError(f"Unknown sim_aggregation: {sim_aggregation}")
     
-    # Output paths
-    parser.add_argument("--checkpoint-path", type=str, default="weights/reid_transformer_latest.pt", help="Path to save trained weights")
-    parser.add_argument("--plot-path", type=str, default="weights/loss_curve.png", help="Path to save loss plot")
+    video_sims = video_sims.cpu()
     
-    # Eval configurations
-    parser.add_argument("--num-embeddings", type=int, default=3, help="Number of random video samples per video for evaluation")
-    parser.add_argument("--skip-eval", action="store_true", help="Skip evaluation phase after training")
+    pids = torch.tensor([meta[0] for meta in val_meta])
+    cids = torch.tensor([meta[1] for meta in val_meta])
     
-    # Wandb configurations
-    parser.add_argument("--wandb-project", type=str, default="open-vocab-mot", help="Wandb project name")
-    parser.add_argument("--wandb-name", type=str, default=None, help="Wandb run name")
-    parser.add_argument("--wandb-entity", type=str, default=None, help="Wandb entity (username or team)")
-    parser.add_argument("--no-wandb", action="store_true", help="Disable wandb logging")
+    N = len(val_meta)
+    
+    print("\n--- Standard Video-to-Video Evaluation (Standard CMC/mAP) ---")
+    cmc_video = torch.zeros(N)
+    ap_video = torch.zeros(N)
+    valid_queries_video = 0
+    
+    for q_idx in range(N):
+        pid = pids[q_idx]
+        cid = cids[q_idx]
+        
+        exclude_mask = (pids == pid) & (cids == cid)
+        
+        sims = video_sims[q_idx].clone()
+        sims[exclude_mask] = -1e9
+        
+        truth_indices = (pids == pid) & ~exclude_mask
+        num_g_truth = truth_indices.sum().item()
+        
+        if num_g_truth == 0:
+            continue
+            
+        valid_queries_video += 1
+        
+        sorted_indices = torch.argsort(sims, descending=True)
+        if sims[sorted_indices[0]] > 0.999:
+            print(f"WARNING: q_idx={q_idx} has max sim {sims[sorted_indices[0]].item()} with idx={sorted_indices[0].item()}! Exact same embedding?")
+        sorted_truth = truth_indices[sorted_indices]
+        
+        first_match_rank = torch.where(sorted_truth)[0][0].item()
+        cmc_video[first_match_rank:] += 1
+        
+        correct_ranks = torch.where(sorted_truth)[0]
+        precision_at_ranks = (torch.arange(1, len(correct_ranks) + 1, dtype=torch.float32) / 
+                               (correct_ranks.float() + 1))
+        ap_video[q_idx] = precision_at_ranks.mean()
+        
+    cmc_video = cmc_video / valid_queries_video if valid_queries_video > 0 else torch.zeros(N)
+    map_video = ap_video.sum() / valid_queries_video if valid_queries_video > 0 else torch.tensor(0.0)
+    
+    print(f"Rank-1 Accuracy:  {cmc_video[0].item() * 100:.2f}%" if len(cmc_video) > 0 else "Rank-1 Accuracy:  N/A")
+    print(f"Rank-5 Accuracy:  {cmc_video[4].item() * 100:.2f}%" if len(cmc_video) > 4 else "Rank-5 Accuracy:  N/A")
+    print(f"Rank-10 Accuracy: {cmc_video[9].item() * 100:.2f}%" if len(cmc_video) > 9 else "Rank-10 Accuracy: N/A")
+    print(f"mAP:              {map_video.item() * 100:.2f}%")
+    
+    print("\n--- Person-to-Identity Evaluation (Max over gallery videos) ---")
+    gallery_people = sorted(list(set(pids.tolist())))
+    cmc_identity = torch.zeros(N)
+    valid_queries_identity = 0
+    
+    for q_idx in range(N):
+        pid = pids[q_idx].item()
+        cid = cids[q_idx].item()
+        
+        id_sims = []
+        id_list = []
+        
+        for g_pid in gallery_people:
+            person_mask = (pids == g_pid)
+            if g_pid == pid:
+                person_mask = person_mask & (cids != cid)
+                
+            if person_mask.sum() == 0:
+                continue
+                
+            person_sim = video_sims[q_idx, person_mask].max().item()
+            id_sims.append(person_sim)
+            id_list.append(g_pid)
+            
+        if pid not in id_list:
+            continue
+            
+        valid_queries_identity += 1
+        
+        id_sims = torch.tensor(id_sims)
+        id_list = torch.tensor(id_list)
+        
+        sorted_indices = torch.argsort(id_sims, descending=True)
+        sorted_ids = id_list[sorted_indices]
+        
+        first_match_rank = torch.where(sorted_ids == pid)[0][0].item()
+        cmc_identity[first_match_rank:] += 1
+        
+    cmc_identity = cmc_identity / valid_queries_identity if valid_queries_identity > 0 else torch.zeros(N)
+    
+    print(f"Rank-1 Accuracy:  {cmc_identity[0].item() * 100:.2f}%" if len(cmc_identity) > 0 else "Rank-1 Accuracy:  N/A")
+    print(f"Rank-5 Accuracy:  {cmc_identity[4].item() * 100:.2f}%" if len(cmc_identity) > 4 else "Rank-5 Accuracy:  N/A")
+    print(f"Rank-10 Accuracy: {cmc_identity[9].item() * 100:.2f}%" if len(cmc_identity) > 9 else "Rank-10 Accuracy: N/A")
+    
+    return {
+        "video": {
+            "cmc": cmc_video,
+            "mAP": map_video,
+            "rank_1": cmc_video[0].item() if len(cmc_video) > 0 else 0,
+            "rank_5": cmc_video[4].item() if len(cmc_video) > 4 else 0,
+            "rank_10": cmc_video[9].item() if len(cmc_video) > 9 else 0
+        },
+        "identity": {
+            "cmc": cmc_identity,
+            "rank_1": cmc_identity[0].item() if len(cmc_identity) > 0 else 0,
+            "rank_5": cmc_identity[4].item() if len(cmc_identity) > 4 else 0,
+            "rank_10": cmc_identity[9].item() if len(cmc_identity) > 9 else 0
+        }
+    }
 
-    # Model configurations
-    parser.add_argument("--frame-transformer-dim", type=int, default=512, help="Frame transformer dimension")
-    parser.add_argument("--frame-contrastive-dim", type=int, default=256, help="Frame contrastive dimension")
-    parser.add_argument("--frame-num-heads", type=int, default=8, help="Frame number of heads")
-    parser.add_argument("--frame-num-layers", type=int, default=4, help="Frame number of layers")
-    parser.add_argument("--video-transformer-dim", type=int, default=384, help="Video transformer dimension")
-    parser.add_argument("--video-contrastive-dim", type=int, default=256, help="Video contrastive dimension")
-    parser.add_argument("--video-num-heads", type=int, default=6, help="Video number of heads")
-    parser.add_argument("--video-num-layers", type=int, default=3, help="Video number of layers")
-    parser.add_argument("--dropout", type=float, default=0.1, help="Dropout rate")
 
+
+class DatasetConfig(BaseModel):
+    use_for_training: bool = True
+    weight: float = 1.0
+    frames_per_video: int = 4
+    people_per_batch: int = 16
+    views_per_person: int = 3
+    use_for_eval: bool = False
+
+class DukeDatasetConfig(DatasetConfig):
+    pass
+
+class WhaleDatasetConfig(DatasetConfig):
+    min_num_images: int = 0
+
+class Wildlife10kSubsetDatasetConfig(DatasetConfig):
+    subset_dataset: Wildlife10KDatasets
+    min_num_images: int = 0
+
+
+class TrainConfig(BaseModel):
+    epochs: int = 3
+    batches_per_epoch: int = 300
+    lr: float = 1e-4
+    frame_loss_weight: float = 0.85
+    seed: int = 42
+    dino_checkpoint: str = "facebook/dinov3-vitl16-pretrain-lvd1689m"
+    dino_batch_split: int = 1
+
+    device: str = "cuda"
+    cuda_visible_devices: Optional[str] = None
+
+    checkpoint_path: str = "weights/reid_transformer_latest.pt"
+    plot_path: str = "weights/loss_curve.png"
+
+    num_embeddings: int = 3
+    skip_eval: bool = False
+    eval_batch_size: int = 128
+
+    wandb_project: str = "open-vocab-mot"
+    wandb_name: Optional[str] = None
+    wandb_entity: Optional[str] = None
+    no_wandb: bool = False
+
+    frame_transformer_dim: int = 512
+    frame_contrastive_dim: int = 256
+    frame_num_heads: int = 8
+    frame_num_layers: int = 4
+    video_transformer_dim: int = 384
+    video_contrastive_dim: int = 256
+    video_num_heads: int = 6
+    video_num_layers: int = 3
+    dropout: float = 0.1
+
+    duke: DukeDatasetConfig = Field(default_factory=DukeDatasetConfig)
+    whale: WhaleDatasetConfig = Field(default_factory=WhaleDatasetConfig)
+    wildlife_subsets: list[Wildlife10kSubsetDatasetConfig] = Field(default_factory=list)
+
+@hydra.main(version_base=None, config_path="../configs/train_and_evaluate_multiple", config_name="config")
+def main(cfg: DictConfig):
     """
     Example run command:
-    export CUDA_VISIBLE_DEVICES=0,1,2,3
-    uv run accelerate launch --multi_gpu --num_machines 1 --num_processes 4 \
-        scripts/train_and_evaluate_duke_parallel.py \
-        --epochs 12 \
-        --batches-per-epoch 600 \
-        --lr 1e-4 \
-        --dino-checkpoint facebook/dinov3-vitl16-pretrain-lvd1689m \
-        --dino-batch-split 4 \
-        --frames-per-video 8 \
-        --people-per-batch 16 \
-        --views-per-person 3 \
-        --checkpoint-path weights/reid_transformer_duke_parallel.pt \
-        --plot-path weights/loss_curve_duke.png \
-        --num-embeddings 3 \
-        --wandb-project open-vocab-mot \
-        --wandb-name train-duke-parallel-largest
-    
+    export CUDA_VISIBLE_DEVICES=1,2
+    uv run accelerate launch --multi_gpu --num_processes=2 scripts/train_and_evaluate_multiple_parallel.py
+
+    export CUDA_VISIBLE_DEVICES=0
+    uv run accelerate launch scripts/train_and_evaluate_multiple_parallel.py
     """
-    
-    args = parser.parse_args()
+    try:
+        args = TrainConfig(**OmegaConf.to_container(cfg, resolve=True))
+    except Exception as e:
+        print("Configuration validation error:", e)
+        sys.exit(1)
+
+    print(args.model_dump_json(indent=2))
 
     # Initialize Accelerate with bf16 and even_batches=False
     dataloader_config = DataLoaderConfiguration(even_batches=False)
@@ -541,7 +721,7 @@ def main():
             project=args.wandb_project,
             name=args.wandb_name,
             entity=args.wandb_entity,
-            config=vars(args)
+            config=args.model_dump()
         )
         
     device = accelerator.device
@@ -568,43 +748,112 @@ def main():
         plot_file = Path(args.plot_path)
         plot_file.parent.mkdir(parents=True, exist_ok=True)
 
-    if accelerator.is_main_process:
-        print("Loading DukeMTMC dataset for training...")
-    
-    train_ds = DukeMTMCVideoDataset(
-        ds_root=DUKEMTMC_VIDEO_REID_PATH,
-        main_split=DukeSplit.TRAIN,
-        sidecar_root=DUKEMTMC_VIDEO_REID_SIDECAR_PATH,
-        load_image_pil=False,
-        load_image_tensor=True,
-        load_segmentations=True,
-        verbose=accelerator.is_main_process
-    )
-    
-    if accelerator.is_main_process:
-        print("Setting up Batch Sampler...")
-        
-    train_sampler = VideoReIDKPFBatchSampler(
-        train_ds,
-        batches_per_epoch=args.batches_per_epoch,
-        num_identities_per_batch=args.people_per_batch,
-        num_sequences_per_identity=args.views_per_person,
-        num_frames_per_sequence=args.frames_per_video,
-        allow_same_identity_same_sequence=True,
-        allow_reduced_sequences_per_identity=False,
-        allow_resampling_sample_indices=True,
-        epoch_deterministic=False,
-        seed=args.seed,
-        verbose=accelerator.is_main_process
-    )
-    
-    train_loader = DataLoader(
-        dataset=train_ds,
-        collate_fn=collate_video_reid_ds,
-        batch_sampler=train_sampler,
-        num_workers=4,
-        pin_memory=True
-    )
+    duke_loader = None
+    if args.duke.use_for_training:
+        if accelerator.is_main_process:
+            print("Loading DukeMTMC dataset for training...")
+        duke_ds = DukeMTMCVideoDataset(
+            ds_root=DUKEMTMC_VIDEO_REID_PATH,
+            main_split=DukeSplit.TRAIN,
+            sidecar_root=DUKEMTMC_VIDEO_REID_SIDECAR_PATH,
+            load_image_pil=False,
+            load_image_tensor=True,
+            load_segmentations=True,
+            verbose=accelerator.is_main_process
+        )
+        duke_iterable = VideoReIDKPFBatchIterableDataset(
+            duke_ds,
+            batches_per_epoch=None,
+            num_identities_per_batch=args.duke.people_per_batch,
+            num_sequences_per_identity=args.duke.views_per_person,
+            num_frames_per_sequence=args.duke.frames_per_video,
+            allow_same_identity_same_sequence=True,
+            allow_reduced_sequences_per_identity=False,
+            allow_resampling_sample_indices=True,
+            epoch_deterministic=False,
+            seed=args.seed + accelerator.process_index * 100,
+            verbose=accelerator.is_main_process
+        )
+        duke_loader = DataLoader(
+            dataset=duke_iterable,
+            batch_size=None,
+            collate_fn=collate_video_reid_ds,
+            num_workers=4,
+            pin_memory=True
+        )
+
+    whale_loader = None
+    if args.whale.use_for_training:
+        if accelerator.is_main_process:
+            print("Loading Whale dataset for training...")
+        whale_ds = WhaleDataset(
+            ds_root=WHALE_DATASET_PATH,
+            split=WhaleSplit.TRAIN,
+            sidecar_root=WHALE_DATASET_SIDECAR_PATH,
+            load_image_pil=False,
+            load_image_tensor=True,
+            load_segmentations=True,
+            min_num_images=args.whale.min_num_images,
+            verbose=accelerator.is_main_process
+        )
+        whale_iterable = VideoReIDKPFBatchIterableDataset(
+            whale_ds,
+            batches_per_epoch=None,
+            num_identities_per_batch=args.whale.people_per_batch,
+            num_sequences_per_identity=args.whale.views_per_person,
+            num_frames_per_sequence=args.whale.frames_per_video,
+            allow_same_identity_same_sequence=True,
+            allow_reduced_sequences_per_identity=False,
+            allow_resampling_sample_indices=True,
+            epoch_deterministic=False,
+            seed=args.seed + 1 + accelerator.process_index * 100,
+            verbose=accelerator.is_main_process
+        )
+        whale_loader = DataLoader(
+            dataset=whale_iterable,
+            batch_size=None,
+            collate_fn=collate_video_reid_ds,
+            num_workers=4,
+            pin_memory=True
+        )
+
+    wildlife_loaders = {}
+    for subset_cfg in args.wildlife_subsets:
+        if subset_cfg.use_for_training:
+            subset_name = subset_cfg.subset_dataset
+            if accelerator.is_main_process:
+                print(f"Loading Wildlife10K subset {subset_name} for training...")
+            subset_ds = Wildlife10KSubsetDataset(
+                ds_root=WILDLIFE_10K_PATH,
+                dataset_name=subset_name,
+                split=Wildlife10KSplit.TRAIN,
+                sidecar_root=WILDLIFE_10K_SIDECAR_PATH,
+                load_image_pil=False,
+                load_image_tensor=True,
+                load_segmentations=True,
+                min_num_images=subset_cfg.min_num_images,
+                verbose=accelerator.is_main_process
+            )
+            subset_iterable = VideoReIDKPFBatchIterableDataset(
+                subset_ds,
+                batches_per_epoch=None,
+                num_identities_per_batch=subset_cfg.people_per_batch,
+                num_sequences_per_identity=subset_cfg.views_per_person,
+                num_frames_per_sequence=subset_cfg.frames_per_video,
+                allow_same_identity_same_sequence=True,
+                allow_reduced_sequences_per_identity=False,
+                allow_resampling_sample_indices=True,
+                epoch_deterministic=False,
+                seed=args.seed + 2 + len(wildlife_loaders) + accelerator.process_index * 100,
+                verbose=accelerator.is_main_process
+            )
+            wildlife_loaders[subset_name] = DataLoader(
+                dataset=subset_iterable,
+                batch_size=None,
+                collate_fn=collate_video_reid_ds,
+                num_workers=4,
+                pin_memory=True
+            )
     
     if accelerator.is_main_process:
         print("Loading Compiled DINO Harness...")
@@ -637,13 +886,43 @@ def main():
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     
     # Prepare with accelerate
-    model, optimizer, train_loader = accelerator.prepare(model, optimizer, train_loader)
+    prepared = accelerator.prepare(model, optimizer)
+    model = prepared[0]
+    optimizer = prepared[1]
+    
+    loaders = {}
+    loader_weights = {}
+    
+    if duke_loader is not None:
+        loaders["duke"] = iter(duke_loader)
+        loader_weights["duke"] = args.duke.weight
+        
+    if whale_loader is not None:
+        loaders["whale"] = iter(whale_loader)
+        loader_weights["whale"] = args.whale.weight
+        
+    for subset_cfg in args.wildlife_subsets:
+        subset_name = subset_cfg.subset_dataset
+        if subset_name in wildlife_loaders:
+            loaders[subset_name] = iter(wildlife_loaders[subset_name])
+            loader_weights[subset_name] = subset_cfg.weight
+        
+    if not loaders:
+        raise ValueError("No datasets enabled for training. Set at least one dataset's 'use' flag to True.")
+
+    dataset_names = [k for k, v in loader_weights.items() if v > 0]
+    weights = [loader_weights[k] for k in dataset_names]
+    total_weight = sum(weights)
+    probs = [w / total_weight for w in weights]
+    dataset_rng = random.Random(args.seed)
     
     history = {
-        "video_loss": [],
-        "frame_loss": [],
         "total_loss": []
     }
+    for name in dataset_names:
+        history[f"{name}_video_loss"] = []
+        history[f"{name}_frame_loss"] = []
+        history[f"{name}_total_loss"] = []
     
     if accelerator.is_main_process:
         print("Starting training...")
@@ -653,9 +932,23 @@ def main():
         if accelerator.is_main_process:
             print(f"\n--- Epoch {epoch+1}/{args.epochs} ---")
             
-        progress = tqdm(train_loader, desc=f"Epoch {epoch+1}", disable=not accelerator.is_main_process)
+        progress = tqdm(total=args.batches_per_epoch, desc=f"Epoch {epoch+1}", disable=not accelerator.is_main_process)
         
-        for batch_idx, batch in enumerate(progress):
+        for batch_idx in range(args.batches_per_epoch):
+            selected_ds_name = dataset_rng.choices(dataset_names, weights=probs, k=1)[0]
+            selected_loader = loaders[selected_ds_name]
+            
+            try:
+                batch = next(selected_loader)
+            except StopIteration:
+                if selected_ds_name == "duke":
+                    loaders["duke"] = iter(duke_loader)
+                elif selected_ds_name == "whale":
+                    loaders["whale"] = iter(whale_loader)
+                elif selected_ds_name in wildlife_loaders:
+                    loaders[selected_ds_name] = iter(wildlife_loaders[selected_ds_name])
+                selected_loader = loaders[selected_ds_name]
+                batch = next(selected_loader)
             # 1. Extract DINO embeddings (Gradients disabled for DINO)
             with torch.no_grad():
                 valid_imgs = []
@@ -758,24 +1051,29 @@ def main():
             
             # Track history and log (only on main process)
             if accelerator.is_main_process:
-                history["video_loss"].append(video_loss.item())
-                history["frame_loss"].append(frame_loss.item())
+                history[f"{selected_ds_name}_video_loss"].append(video_loss.item())
+                history[f"{selected_ds_name}_frame_loss"].append(frame_loss.item())
+                history[f"{selected_ds_name}_total_loss"].append(total_loss.item())
                 history["total_loss"].append(total_loss.item())
                 
                 if not args.no_wandb:
                     wandb.log({
                         "train/loss": total_loss.item(),
-                        "train/video_loss": video_loss.item(),
-                        "train/frame_loss": frame_loss.item(),
+                        f"train/{selected_ds_name}/video_loss": video_loss.item(),
+                        f"train/{selected_ds_name}/frame_loss": frame_loss.item(),
+                        f"train/{selected_ds_name}/loss": total_loss.item(),
                         "epoch": epoch + 1,
                         "batch": batch_idx,
                     })
                 
-                progress.set_postfix({"Loss": f"{total_loss.item():.4f}"})
+                progress.set_postfix({"Loss": f"{total_loss.item():.4f}", "DS": selected_ds_name})
                 
                 if batch_idx % 10 == 0:
-                    print(f"Batch {batch_idx}: Total Loss = {total_loss.item():.4f} "
+                    print(f"Batch {batch_idx} [{selected_ds_name}]: Total Loss = {total_loss.item():.4f} "
                           f"(Video: {video_loss.item():.4f}, Frame: {frame_loss.item():.4f})")
+                
+                # Update progress bar
+                progress.update(1)
             
             # Explicitly free memory at the end of the batch
             del dino_embeddings
@@ -797,9 +1095,10 @@ def main():
         # Save loss plot
         print(f"Generating loss plot to {args.plot_path}...")
         plt.figure(figsize=(10, 6))
-        plt.plot(history["video_loss"], label="Video Loss", alpha=0.7)
-        plt.plot(history["frame_loss"], label="Frame Loss", alpha=0.7)
         plt.plot(history["total_loss"], label="Total Loss", linewidth=2)
+        for name in dataset_names:
+            if len(history[f"{name}_total_loss"]) > 0:
+                plt.plot(history[f"{name}_total_loss"], label=f"{name} Total Loss", alpha=0.5)
         plt.xlabel("Batch Index")
         plt.ylabel("Loss")
         plt.title(f"Training Loss over Time (Frame Weight = {args.frame_loss_weight})")
@@ -822,78 +1121,178 @@ def main():
         
     model.eval()
     
-    if accelerator.is_main_process:
-        print("Loading DukeMTMC dataset splits for evaluation...")
-        
-    gallery_ds = DukeMTMCVideoDataset(
-        ds_root=DUKEMTMC_VIDEO_REID_PATH,
-        main_split=DukeSplit.GALLERY,
-        sidecar_root=DUKEMTMC_VIDEO_REID_SIDECAR_PATH,
-        load_image_pil=False,
-        load_image_tensor=True,
-        load_segmentations=True,
-        verbose=accelerator.is_main_process
-    )
-    
-    query_ds = DukeMTMCVideoDataset(
-        ds_root=DUKEMTMC_VIDEO_REID_PATH,
-        main_split=DukeSplit.QUERY,
-        sidecar_root=DUKEMTMC_VIDEO_REID_SIDECAR_PATH,
-        load_image_pil=False,
-        load_image_tensor=True,
-        load_segmentations=True,
-        verbose=accelerator.is_main_process
-    )
-    
-    if accelerator.is_main_process:
-        print("\nProcessing Query Dataset...")
-        
-    processed_query_ds = process_duke_ds(
-        query_ds,
-        model,
-        dino_harness,
-        accelerator,
-        frames_per_video=args.frames_per_video,
-        batch_size=512,
-        num_video_embeddings_per_video=args.num_embeddings,
-        dino_batch_split=args.dino_batch_split
-    )
-    
-    if accelerator.is_main_process:
-        print("\nProcessing Gallery Dataset...")
-        
-    processed_gallery_ds = process_duke_ds(
-        gallery_ds,
-        model,
-        dino_harness,
-        accelerator,
-        frames_per_video=args.frames_per_video,
-        batch_size=512,
-        num_video_embeddings_per_video=args.num_embeddings,
-        dino_batch_split=args.dino_batch_split
-    )
-    
-    if accelerator.is_main_process:
-        print("\nRunning metrics computation...")
-        eval_metrics = evaluate_duke_reid(
-            processed_query_ds,
-            processed_gallery_ds,
-            num_embeddings_per_video=args.num_embeddings,
-            sim_aggregation="max",
-            device=device
+    if args.duke.use_for_eval:
+        if accelerator.is_main_process:
+            print("Loading DukeMTMC test sets for evaluation...")
+        gallery_ds = DukeMTMCVideoDataset(
+            ds_root=DUKEMTMC_VIDEO_REID_PATH,
+            main_split=DukeSplit.GALLERY,
+            sidecar_root=DUKEMTMC_VIDEO_REID_SIDECAR_PATH,
+            load_image_pil=False,
+            load_image_tensor=True,
+            load_segmentations=True,
+            verbose=accelerator.is_main_process
         )
+        query_ds = DukeMTMCVideoDataset(
+            ds_root=DUKEMTMC_VIDEO_REID_PATH,
+            main_split=DukeSplit.QUERY,
+            sidecar_root=DUKEMTMC_VIDEO_REID_SIDECAR_PATH,
+            load_image_pil=False,
+            load_image_tensor=True,
+            load_segmentations=True,
+            verbose=accelerator.is_main_process
+        )
+        
+        if accelerator.is_main_process:
+            print("\nProcessing Duke Query Dataset...")
+        processed_query_ds = process_val_ds(
+            query_ds,
+            model,
+            dino_harness,
+            accelerator,
+            frames_per_video=args.duke.frames_per_video,
+            batch_size=args.eval_batch_size,
+            num_video_embeddings_per_video=args.num_embeddings,
+            dino_batch_split=args.dino_batch_split,
+            split_single_sequences=False
+        )
+        
+        if accelerator.is_main_process:
+            print("\nProcessing Duke Gallery Dataset...")
+        processed_gallery_ds = process_val_ds(
+            gallery_ds,
+            model,
+            dino_harness,
+            accelerator,
+            frames_per_video=args.duke.frames_per_video,
+            batch_size=args.eval_batch_size,
+            num_video_embeddings_per_video=args.num_embeddings,
+            dino_batch_split=args.dino_batch_split,
+            split_single_sequences=False
+        )
+        
+        if accelerator.is_main_process:
+            print("\nRunning metrics computation for Duke...")
+            eval_metrics = evaluate_duke_reid(
+                processed_query_ds,
+                processed_gallery_ds,
+                num_embeddings_per_video=args.num_embeddings,
+                sim_aggregation="max",
+                device=device
+            )
 
-        if not args.no_wandb:
-            wandb.log({
-                "eval/video_rank_1": eval_metrics["video"]["rank_1"],
-                "eval/video_rank_5": eval_metrics["video"]["rank_5"],
-                "eval/video_rank_10": eval_metrics["video"]["rank_10"],
-                "eval/video_mAP": eval_metrics["video"]["mAP"],
-                "eval/identity_rank_1": eval_metrics["identity"]["rank_1"],
-                "eval/identity_rank_5": eval_metrics["identity"]["rank_5"],
-                "eval/identity_rank_10": eval_metrics["identity"]["rank_10"],
-            })
-            wandb.finish()
+            if not args.no_wandb:
+                wandb.log({
+                    "eval/duke/video_rank_1": eval_metrics["video"]["rank_1"],
+                    "eval/duke/video_rank_5": eval_metrics["video"]["rank_5"],
+                    "eval/duke/video_rank_10": eval_metrics["video"]["rank_10"],
+                    "eval/duke/video_mAP": eval_metrics["video"]["mAP"],
+                    "eval/duke/identity_rank_1": eval_metrics["identity"]["rank_1"],
+                    "eval/duke/identity_rank_5": eval_metrics["identity"]["rank_5"],
+                    "eval/duke/identity_rank_10": eval_metrics["identity"]["rank_10"],
+                })
+
+    if args.whale.use_for_eval:
+        if accelerator.is_main_process:
+            print("\nLoading WhaleDataset VAL set for evaluation...")
+        whale_val_ds = WhaleDataset(
+            ds_root=WHALE_DATASET_PATH,
+            split=WhaleSplit.VAL,
+            sidecar_root=WHALE_DATASET_SIDECAR_PATH,
+            load_image_pil=False,
+            load_image_tensor=True,
+            load_segmentations=True,
+            min_num_images=args.whale.min_num_images,
+            verbose=accelerator.is_main_process
+        )
+        
+        if accelerator.is_main_process:
+            print("\nProcessing Whale Validation Dataset...")
+        processed_val_ds = process_val_ds(
+            whale_val_ds,
+            model,
+            dino_harness,
+            accelerator,
+            frames_per_video=args.whale.frames_per_video,
+            batch_size=args.eval_batch_size,
+            num_video_embeddings_per_video=args.num_embeddings,
+            dino_batch_split=args.dino_batch_split,
+            split_single_sequences=True
+        )
+        
+        if accelerator.is_main_process:
+            print("\nRunning metrics computation for Whale...")
+            eval_metrics = evaluate_reid(
+                processed_val_ds,
+                num_embeddings_per_video=args.num_embeddings,
+                sim_aggregation="max",
+                device=device
+            )
+
+            if not args.no_wandb:
+                wandb.log({
+                    "eval/whale/video_rank_1": eval_metrics["video"]["rank_1"],
+                    "eval/whale/video_rank_5": eval_metrics["video"]["rank_5"],
+                    "eval/whale/video_rank_10": eval_metrics["video"]["rank_10"],
+                    "eval/whale/video_mAP": eval_metrics["video"]["mAP"],
+                    "eval/whale/identity_rank_1": eval_metrics["identity"]["rank_1"],
+                    "eval/whale/identity_rank_5": eval_metrics["identity"]["rank_5"],
+                    "eval/whale/identity_rank_10": eval_metrics["identity"]["rank_10"],
+                })
+
+    for subset_cfg in args.wildlife_subsets:
+        if subset_cfg.use_for_eval:
+            subset_name = subset_cfg.subset_dataset
+            if accelerator.is_main_process:
+                print(f"\nLoading Wildlife10K subset {subset_name} VAL set for evaluation...")
+            subset_val_ds = Wildlife10KSubsetDataset(
+                ds_root=WILDLIFE_10K_PATH,
+                dataset_name=subset_name,
+                split=Wildlife10KSplit.VAL,
+                sidecar_root=WILDLIFE_10K_SIDECAR_PATH,
+                load_image_pil=False,
+                load_image_tensor=True,
+                load_segmentations=True,
+                min_num_images=subset_cfg.min_num_images,
+                verbose=accelerator.is_main_process
+            )
+            
+            if accelerator.is_main_process:
+                print(f"\nProcessing {subset_name} Validation Dataset...")
+            processed_val_ds = process_val_ds(
+                subset_val_ds,
+                model,
+                dino_harness,
+                accelerator,
+                frames_per_video=subset_cfg.frames_per_video,
+                batch_size=args.eval_batch_size,
+                num_video_embeddings_per_video=args.num_embeddings,
+                dino_batch_split=args.dino_batch_split,
+                split_single_sequences=True
+            )
+            
+            if accelerator.is_main_process:
+                print(f"\nRunning metrics computation for {subset_name}...")
+                eval_metrics = evaluate_reid(
+                    processed_val_ds,
+                    num_embeddings_per_video=args.num_embeddings,
+                    sim_aggregation="max",
+                    device=device
+                )
+
+                if not args.no_wandb:
+                    wandb.log({
+                        f"eval/{subset_name}/video_rank_1": eval_metrics["video"]["rank_1"],
+                        f"eval/{subset_name}/video_rank_5": eval_metrics["video"]["rank_5"],
+                        f"eval/{subset_name}/video_rank_10": eval_metrics["video"]["rank_10"],
+                        f"eval/{subset_name}/video_mAP": eval_metrics["video"]["mAP"],
+                        f"eval/{subset_name}/identity_rank_1": eval_metrics["identity"]["rank_1"],
+                        f"eval/{subset_name}/identity_rank_5": eval_metrics["identity"]["rank_5"],
+                        f"eval/{subset_name}/identity_rank_10": eval_metrics["identity"]["rank_10"],
+                    })
+
+    if accelerator.is_main_process and not args.no_wandb:
+        wandb.finish()
 
 
 if __name__ == "__main__":

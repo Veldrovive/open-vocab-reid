@@ -4,6 +4,7 @@ from jaxtyping import Float
 import torch
 import torch.nn as nn
 from torch.nn.utils.rnn import pad_sequence
+from torch.utils.checkpoint import checkpoint
 
 
 # Define output types for the hierarchical model
@@ -131,7 +132,21 @@ class HierarchicalVideoReIDTransformer(nn.Module):
         cls_mask = torch.zeros((total_frames, 1), dtype=torch.bool, device=device)
         frame_padding_mask = torch.cat((cls_mask, frame_mask), dim=1) # (total_frames, max_len + 1)
 
-        frame_transformer_out = self.frame_transformer(frame_transformer_input, src_key_padding_mask=frame_padding_mask)
+        # frame_transformer_out = self.frame_transformer(frame_transformer_input, src_key_padding_mask=frame_padding_mask)
+        frame_transformer_out = frame_transformer_input
+        
+        # Ensure requires_grad is True to trigger the backward pass properly
+        if not frame_transformer_out.requires_grad:
+            frame_transformer_out.requires_grad_(True)
+            
+        # Iterate through the internal layers of the TransformerEncoder
+        for layer in self.frame_transformer.layers:
+            frame_transformer_out = checkpoint(
+                layer,
+                frame_transformer_out,
+                use_reentrant=False,
+                src_key_padding_mask=frame_padding_mask
+            )
 
         # Extract the state of the [CLS] token
         frame_cls_out = frame_transformer_out[:, 0, :] # (total_frames, frame_transformer_dim)

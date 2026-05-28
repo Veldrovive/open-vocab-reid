@@ -1,0 +1,89 @@
+epochs: 6
+batches_per_epoch: 300
+lr: 1.0e-4
+frame_loss_weight: 0.85
+seed: 42
+dino_checkpoint: "facebook/dinov3-vitl16-pretrain-lvd1689m"
+dino_batch_split: 4
+
+device: "cuda"
+cuda_visible_devices: null
+
+checkpoint_path: "weights/reid_transformer_latest.pt"
+plot_path: "weights/loss_curve.png"
+
+num_embeddings: 3
+skip_eval: false
+eval_batch_size: 128
+
+wandb_project: "open-vocab-mot-tests"
+wandb_name: "large"
+wandb_entity: null
+no_wandb: false
+
+frame_transformer_dim: 1024
+frame_contrastive_dim: 256
+frame_num_heads: 8
+frame_num_layers: 4
+video_transformer_dim: 512
+video_contrastive_dim: 256
+video_num_heads: 8
+video_num_layers: 4
+dropout: 0.1
+
+# frame_transformer_dim: 256
+# frame_contrastive_dim: 256
+# frame_num_heads: 4
+# frame_num_layers: 3
+# video_transformer_dim: 256
+# video_contrastive_dim: 256
+# video_num_heads: 4
+# video_num_layers: 3
+# dropout: 0.1
+
+duke:
+  use_for_training: true
+  weight: 1.0
+  frames_per_video: 8
+  people_per_batch: 16
+  views_per_person: 3
+  use_for_eval: true
+
+whale:
+  use_for_training: true
+  weight: 0.2
+  frames_per_video: 4
+  people_per_batch: 16
+  views_per_person: 2
+  min_num_images: 8
+  use_for_eval: true
+
+wildlife_subsets:
+  - subset_dataset: 'ATRW'
+    use_for_training: true
+    weight: 0.2
+    frames_per_video: 4
+    people_per_batch: 16
+    views_per_person: 2
+    min_num_images: 8
+    use_for_eval: false
+
+  - subset_dataset: 'CatIndividualImages'
+    use_for_training: true
+    weight: 0.2
+    frames_per_video: 4
+    people_per_batch: 16
+    views_per_person: 2
+    min_num_images: 8
+    use_for_eval: true
+
+  - subset_dataset: 'DogFaceNet'
+    use_for_training: true
+    weight: 0.2
+    frames_per_video: 4
+    people_per_batch: 16
+    views_per_person: 2
+    min_num_images: 8
+    use_for_eval: false
+
+    
