@@ -56,14 +56,14 @@ from open_vocab_mot.definitions import (
 )
 from aidan_lib.models.dino_lib_compiled import DINOv3CompiledHarness
 
-from open_vocab_mot.models import HierarchicalVideoReIDTransformer
+from open_vocab_mot.models import HierarchicalVideoReIDTransformer, NestedHierarchicalVideoReIDTransformer
 from open_vocab_mot.losses import CircleLossWithUnknowns
 
 
 @torch.no_grad()
 def process_val_ds(
     ds: Dataset,
-    model: HierarchicalVideoReIDTransformer,
+    model: HierarchicalVideoReIDTransformer | NestedHierarchicalVideoReIDTransformer,
     dino_harness: DINOv3CompiledHarness,
     accelerator: Accelerator,
     frames_per_video: int,
@@ -679,6 +679,7 @@ class TrainConfig(BaseModel):
     wandb_entity: Optional[str] = None
     no_wandb: bool = False
 
+    use_nested_tensors: bool = True
     frame_transformer_dim: int = 512
     frame_contrastive_dim: int = 256
     frame_num_heads: int = 8
@@ -692,6 +693,62 @@ class TrainConfig(BaseModel):
     duke: DukeDatasetConfig = Field(default_factory=DukeDatasetConfig)
     whale: WhaleDatasetConfig = Field(default_factory=WhaleDatasetConfig)
     wildlife_subsets: list[Wildlife10kSubsetDatasetConfig] = Field(default_factory=list)
+
+from torch.utils.data import IterableDataset, get_worker_info
+
+class CombinedIterableDataset(IterableDataset):
+    def __init__(
+        self,
+        datasets: list[IterableDataset],
+        dataset_names: list[str],
+        weights: list[float],
+        batches_per_epoch: int,
+        seed: int = 42,
+    ):
+        self.datasets = datasets
+        self.dataset_names = dataset_names
+        self.weights = weights
+        self.batches_per_epoch = batches_per_epoch
+        self.seed = seed
+
+    def __iter__(self):
+        worker_info = get_worker_info()
+        seed = self.seed
+        if worker_info is not None:
+            seed += worker_info.id
+            
+        rng = random.Random(seed)
+        
+        iters = [iter(ds) for ds in self.datasets]
+        
+        if self.batches_per_epoch is not None:
+            if worker_info is not None:
+                per_worker = self.batches_per_epoch // worker_info.num_workers
+                worker_id = worker_info.id
+                if worker_id < self.batches_per_epoch % worker_info.num_workers:
+                    per_worker += 1
+                batches_to_yield = per_worker
+            else:
+                batches_to_yield = self.batches_per_epoch
+        else:
+            batches_to_yield = float('inf')
+
+        batch_count = 0
+        while batch_count < batches_to_yield:
+            chosen_idx = rng.choices(range(len(iters)), weights=self.weights, k=1)[0]
+            try:
+                batch_items = next(iters[chosen_idx])
+            except StopIteration:
+                iters[chosen_idx] = iter(self.datasets[chosen_idx])
+                batch_items = next(iters[chosen_idx])
+            
+            yield batch_items, self.dataset_names[chosen_idx]
+            batch_count += 1
+
+def combined_collate_fn(data):
+    # data is a single yielded element from the combined iterable dataset
+    batch_items, dataset_name = data
+    return collate_video_reid_ds(batch_items), dataset_name
 
 @hydra.main(version_base=None, config_path="../configs/train_and_evaluate_multiple", config_name="config")
 def main(cfg: DictConfig):
@@ -748,7 +805,7 @@ def main(cfg: DictConfig):
         plot_file = Path(args.plot_path)
         plot_file.parent.mkdir(parents=True, exist_ok=True)
 
-    duke_loader = None
+    duke_iterable = None
     if args.duke.use_for_training:
         if accelerator.is_main_process:
             print("Loading DukeMTMC dataset for training...")
@@ -774,15 +831,8 @@ def main(cfg: DictConfig):
             seed=args.seed + accelerator.process_index * 100,
             verbose=accelerator.is_main_process
         )
-        duke_loader = DataLoader(
-            dataset=duke_iterable,
-            batch_size=None,
-            collate_fn=collate_video_reid_ds,
-            num_workers=4,
-            pin_memory=True
-        )
 
-    whale_loader = None
+    whale_iterable = None
     if args.whale.use_for_training:
         if accelerator.is_main_process:
             print("Loading Whale dataset for training...")
@@ -809,15 +859,8 @@ def main(cfg: DictConfig):
             seed=args.seed + 1 + accelerator.process_index * 100,
             verbose=accelerator.is_main_process
         )
-        whale_loader = DataLoader(
-            dataset=whale_iterable,
-            batch_size=None,
-            collate_fn=collate_video_reid_ds,
-            num_workers=4,
-            pin_memory=True
-        )
 
-    wildlife_loaders = {}
+    wildlife_iterables = {}
     for subset_cfg in args.wildlife_subsets:
         if subset_cfg.use_for_training:
             subset_name = subset_cfg.subset_dataset
@@ -844,16 +887,10 @@ def main(cfg: DictConfig):
                 allow_reduced_sequences_per_identity=False,
                 allow_resampling_sample_indices=True,
                 epoch_deterministic=False,
-                seed=args.seed + 2 + len(wildlife_loaders) + accelerator.process_index * 100,
+                seed=args.seed + 2 + len(wildlife_iterables) + accelerator.process_index * 100,
                 verbose=accelerator.is_main_process
             )
-            wildlife_loaders[subset_name] = DataLoader(
-                dataset=subset_iterable,
-                batch_size=None,
-                collate_fn=collate_video_reid_ds,
-                num_workers=4,
-                pin_memory=True
-            )
+            wildlife_iterables[subset_name] = subset_iterable
     
     if accelerator.is_main_process:
         print("Loading Compiled DINO Harness...")
@@ -869,7 +906,13 @@ def main(cfg: DictConfig):
     if accelerator.is_main_process:
         print("Initializing Hierarchical Video ReID Transformer model...")
         
-    model = HierarchicalVideoReIDTransformer(
+    if args.use_nested_tensors:
+        print(f"Using a nested NestedHierarchicalVideoReIDTransformer")
+        model_class = NestedHierarchicalVideoReIDTransformer
+    else:
+        print(f"Using a HierarchicalVideoReIDTransformer")
+        model_class = HierarchicalVideoReIDTransformer
+    model = model_class(
         input_dim=dino_harness.embedding_dim,
         frame_transformer_dim=args.frame_transformer_dim,
         frame_contrastive_dim=args.frame_contrastive_dim,
@@ -890,31 +933,47 @@ def main(cfg: DictConfig):
     model = prepared[0]
     optimizer = prepared[1]
     
-    loaders = {}
-    loader_weights = {}
-    
-    if duke_loader is not None:
-        loaders["duke"] = iter(duke_loader)
-        loader_weights["duke"] = args.duke.weight
+    # Combine datasets
+    datasets = []
+    dataset_names = []
+    weights = []
+
+    if duke_iterable is not None:
+        datasets.append(duke_iterable)
+        dataset_names.append("duke")
+        weights.append(args.duke.weight)
         
-    if whale_loader is not None:
-        loaders["whale"] = iter(whale_loader)
-        loader_weights["whale"] = args.whale.weight
+    if whale_iterable is not None:
+        datasets.append(whale_iterable)
+        dataset_names.append("whale")
+        weights.append(args.whale.weight)
         
     for subset_cfg in args.wildlife_subsets:
         subset_name = subset_cfg.subset_dataset
-        if subset_name in wildlife_loaders:
-            loaders[subset_name] = iter(wildlife_loaders[subset_name])
-            loader_weights[subset_name] = subset_cfg.weight
-        
-    if not loaders:
+        if subset_name in wildlife_iterables:
+            datasets.append(wildlife_iterables[subset_name])
+            dataset_names.append(subset_name)
+            weights.append(subset_cfg.weight)
+            
+    if not datasets:
         raise ValueError("No datasets enabled for training. Set at least one dataset's 'use' flag to True.")
 
-    dataset_names = [k for k, v in loader_weights.items() if v > 0]
-    weights = [loader_weights[k] for k in dataset_names]
-    total_weight = sum(weights)
-    probs = [w / total_weight for w in weights]
-    dataset_rng = random.Random(args.seed)
+    combined_dataset = CombinedIterableDataset(
+        datasets=datasets,
+        dataset_names=dataset_names,
+        weights=weights,
+        batches_per_epoch=args.batches_per_epoch,
+        seed=args.seed + accelerator.process_index * 100,
+    )
+
+    combined_loader = DataLoader(
+        dataset=combined_dataset,
+        batch_size=None,
+        collate_fn=combined_collate_fn,
+        num_workers=4,
+        pin_memory=True
+    )
+
     
     history = {
         "total_loss": []
@@ -934,21 +993,10 @@ def main(cfg: DictConfig):
             
         progress = tqdm(total=args.batches_per_epoch, desc=f"Epoch {epoch+1}", disable=not accelerator.is_main_process)
         
-        for batch_idx in range(args.batches_per_epoch):
-            selected_ds_name = dataset_rng.choices(dataset_names, weights=probs, k=1)[0]
-            selected_loader = loaders[selected_ds_name]
-            
-            try:
-                batch = next(selected_loader)
-            except StopIteration:
-                if selected_ds_name == "duke":
-                    loaders["duke"] = iter(duke_loader)
-                elif selected_ds_name == "whale":
-                    loaders["whale"] = iter(whale_loader)
-                elif selected_ds_name in wildlife_loaders:
-                    loaders[selected_ds_name] = iter(wildlife_loaders[selected_ds_name])
-                selected_loader = loaders[selected_ds_name]
-                batch = next(selected_loader)
+        for batch_idx, (batch, selected_ds_name) in enumerate(combined_loader):
+            if batch_idx >= args.batches_per_epoch:
+                break
+                
             # 1. Extract DINO embeddings (Gradients disabled for DINO)
             with torch.no_grad():
                 valid_imgs = []

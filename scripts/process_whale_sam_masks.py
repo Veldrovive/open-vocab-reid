@@ -1,21 +1,11 @@
 import argparse
-import time
 from pathlib import Path
-from tqdm import tqdm
 
 import torch
 from torch.utils.data import DataLoader
-from torchvision.utils import save_image
 
-# Assuming your imports map like this based on the abstract structure
-from open_vocab_mot.data import WhaleDataset
-from open_vocab_mot.data.video_reid_abc import VideoReIDItem
+from open_vocab_mot.data import WhaleDataset, custom_collate, process_sam_masks_for_dataset
 from aidan_lib.models.sam3_batched_img import SAM3BatchedImageHarness
-
-
-def custom_collate(batch: list[VideoReIDItem]) -> list[VideoReIDItem]:
-    """Simple collate to keep the list of items intact without a specific Batch dataclass."""
-    return batch
 
 
 def main():
@@ -58,61 +48,28 @@ def main():
         num_workers=args.num_workers
     )
 
-    time_converting_to_tensor = 0
-    time_in_sam = 0
-    time_finding_best_mask = 0
-    time_saving = 0
+    def get_items_and_prompts_fn(batch):
+        return [(batch, "Whale")]
+
+    def get_image_tensor_fn(item):
+        return item.frame_tensor
+
+    def get_save_path_fn(item):
+        rel_path = item.frame_path.relative_to(ds_root)
+        return sidecar_root / rel_path.with_suffix('.png')
 
     print("Starting processing...")
-    for batch in tqdm(loader, desc="Processing Whales"):
-        tensor_image_batch = []
-        
-        start_time = time.perf_counter()
-        for item in batch:
-            # WhaleDataset already gives us a normalized float tensor
-            tensor_image_batch.append(item.frame_tensor.to(args.device))
-        time_converting_to_tensor += time.perf_counter() - start_time
-        
-        start_time = time.perf_counter()
-        # Use "Whale" as the target prompt for this dataset
-        sam_output = sam_harness(tensor_image_batch, "Whale", move_to_cpu=False)
-        time_in_sam += time.perf_counter() - start_time
-
-        start_time = time.perf_counter()
-        major_masks = []
-        for i, frame_out in enumerate(sam_output):
-            if len(frame_out.masks) == 0:
-                _, H, W = tensor_image_batch[i].shape
-                major_masks.append(torch.zeros((H, W), dtype=torch.bool, device=args.device))
-            else:
-                major_mask_idx = torch.argmax(frame_out.masks.sum((1, 2)))
-                major_masks.append(frame_out.masks[major_mask_idx])
-        time_finding_best_mask += time.perf_counter() - start_time
-
-        start_time = time.perf_counter()
-        for idx, item in enumerate(batch):
-            major_mask = major_masks[idx]
-
-            # Reconstruct the correct relative path to mirror the dataset structure
-            rel_path = item.frame_path.relative_to(ds_root)
-            
-            # The WhaleDataset implementation natively checks for .png fallbacks, 
-            # so we just replace the extension rather than appending a suffix
-            sidecar_mask_path = sidecar_root / rel_path.with_suffix('.png')
-            
-            # Ensure our parent directory exists
-            sidecar_mask_path.parent.mkdir(parents=True, exist_ok=True)
-
-            # Save the mask
-            float_mask = major_mask.float()
-            save_image(float_mask, sidecar_mask_path)
-        time_saving += time.perf_counter() - start_time
-
-    print("Finished processing!")
-    print(f"Time moving to device: {time_converting_to_tensor:.2f}s")
-    print(f"Time in SAM: {time_in_sam:.2f}s")
-    print(f"Time finding best mask: {time_finding_best_mask:.2f}s")
-    print(f"Time saving: {time_saving:.2f}s")
+    process_sam_masks_for_dataset(
+        loader=loader,
+        sam_harness=sam_harness,
+        device=args.device,
+        get_items_and_prompts_fn=get_items_and_prompts_fn,
+        get_image_tensor_fn=get_image_tensor_fn,
+        get_save_path_fn=get_save_path_fn,
+        mask_selection_strategy="max_area",
+        desc="Processing Whales",
+        skip_existing=True,
+    )
 
 
 if __name__ == "__main__":

@@ -233,3 +233,186 @@ class HierarchicalVideoReIDTransformer(nn.Module):
         )
 
         return out
+
+
+class NestedHierarchicalVideoReIDTransformer(nn.Module):
+    """
+    Model that processes frames individually followed by together over the whole video,
+    leveraging PyTorch Nested Tensors for optimized, pad-free processing.
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        frame_transformer_dim: int,
+        frame_contrastive_dim: int,
+        frame_num_heads: int,
+        frame_num_layers: int,
+        video_transformer_dim: int,
+        video_contrastive_dim: int,
+        video_num_heads: int,
+        video_num_layers: int,
+        dropout: float = 0.1,
+        max_frame_patches: int = 1024
+    ):
+        super().__init__()
+
+        self.input_dim = input_dim
+        self.max_frame_patches = max_frame_patches
+        self.frame_transformer_dim = frame_transformer_dim
+        self.frame_contrastive_dim = frame_contrastive_dim
+        self.frame_num_heads = frame_num_heads
+        self.frame_num_layers = frame_num_layers
+
+        self.video_transformer_dim = video_transformer_dim
+        self.video_contrastive_dim = video_contrastive_dim
+        self.video_num_heads = video_num_heads
+        self.video_num_layers = video_num_layers
+
+        # Projections
+        self.input_projection = nn.Linear(input_dim, frame_transformer_dim)
+
+        # Frame Transformer
+        self.frame_cls_token = nn.Parameter(torch.randn(1, 1, frame_transformer_dim))
+        frame_encoder_layer = nn.TransformerEncoderLayer(
+            d_model=frame_transformer_dim,
+            nhead=frame_num_heads,
+            dim_feedforward=frame_transformer_dim * frame_num_heads,
+            dropout=dropout,
+            activation='gelu',
+            batch_first=True
+        )
+        self.frame_transformer = nn.TransformerEncoder(frame_encoder_layer, num_layers=frame_num_layers)
+
+        # Intermediary Projections
+        self.frame_contrastive_projection = nn.Linear(frame_transformer_dim, frame_contrastive_dim)
+        self.frame_to_video_projection = nn.Linear(frame_transformer_dim, video_transformer_dim)
+
+        # Video Transformer
+        self.video_cls_token = nn.Parameter(torch.randn(1, 1, video_transformer_dim))
+        video_encoder_layer = nn.TransformerEncoderLayer(
+            d_model=video_transformer_dim,
+            nhead=video_num_heads,
+            dim_feedforward=video_transformer_dim * video_num_heads,
+            dropout=dropout,
+            activation='gelu',
+            batch_first=True
+        )
+        self.video_transformer = nn.TransformerEncoder(video_encoder_layer, num_layers=video_num_layers)
+
+        # Output Projection
+        self.video_contrastive_projection = nn.Linear(video_transformer_dim, video_contrastive_dim)
+
+    def embed_frames(self, video_embeddings: list[list[torch.Tensor]], device: str) -> ReIDFrameOutput:
+        video_indices: list[int] = []
+        frame_embeddings_list: list[torch.Tensor] = []
+        
+        # 1. Flatten into a 1D jagged list
+        for video_index in range(len(video_embeddings)):
+            frame_embeddings = video_embeddings[video_index]
+            video_indices.extend([video_index for _ in range(len(frame_embeddings))])
+            
+            for embed in frame_embeddings:
+                if embed.size(0) > self.max_frame_patches:
+                    indices = torch.linspace(0, embed.size(0) - 1, steps=self.max_frame_patches, device=embed.device).long()
+                    embed = embed[indices]
+                frame_embeddings_list.append(embed)
+                
+        total_videos = len(video_embeddings)
+        total_frames = len(frame_embeddings_list)
+
+        # 2. Pack directly into a nested tensor and project
+        # Linear layer natively supports nested tensor inputs
+        nt_frames = torch.nested.as_nested_tensor(frame_embeddings_list)
+        projected_nt = self.input_projection(nt_frames)
+
+        # 3. Handle [CLS] Token Injection
+        # Unbind back to standard tensors, prepend CLS, and re-nest. This safely preserves autograd.
+        cls_token = self.frame_cls_token.squeeze(0)  # (1, frame_transformer_dim)
+        projected_list = projected_nt.unbind()
+        
+        transformer_input_list = [
+            torch.cat([cls_token, frame_t], dim=0) 
+            for frame_t in projected_list
+        ]
+        
+        frame_transformer_input_nt = torch.nested.as_nested_tensor(transformer_input_list)
+
+        # 4. Pass through Frame Transformer layers
+        # Directly pass the nested tensor through the encoder block
+        frame_transformer_out = self.frame_transformer(frame_transformer_input_nt)
+
+        # 5. Extract [CLS] Token
+        # Convert nested -> padded just to slice index 0 safely
+        padded_frame_out = frame_transformer_out.to_padded_tensor(0.0)
+        frame_cls_out = padded_frame_out[:, 0, :] # (total_frames, frame_transformer_dim)
+
+        # Project extracted class tokens into contrastive space
+        frame_contrastive_embeddings = self.frame_contrastive_projection(frame_cls_out)
+
+        # 6. Re-package back into lists per video
+        video_frame_contrastive_embeddings_list: list[list[torch.Tensor]] = [[] for _ in range(total_videos)]
+        video_frame_cls_tokens_list: list[list[torch.Tensor]] = [[] for _ in range(total_videos)]
+        
+        for i in range(total_frames):
+            video_index = video_indices[i]
+            video_frame_contrastive_embeddings_list[video_index].append(frame_contrastive_embeddings[i])
+            video_frame_cls_tokens_list[video_index].append(frame_cls_out[i])
+
+        # Stack the inner lists
+        video_frame_contrastive_embeddings = [torch.stack(frames) for frames in video_frame_contrastive_embeddings_list]
+        video_frame_cls_tokens = [torch.stack(frames) for frames in video_frame_cls_tokens_list]
+
+        return ReIDFrameOutput(
+            video_frame_contrastive_embeddings=video_frame_contrastive_embeddings,
+            video_frame_cls_tokens=video_frame_cls_tokens
+        )
+
+    def embed_video_frames(self, video_frame_cls_tokens: list[torch.Tensor], device: str) -> RIDVideoOutput:
+        # video_frame_cls_tokens is a list of (frames_in_video, frame_transformer_dim)
+        
+        # 1. Pack into nested tensor and project
+        nt_video_frames = torch.nested.as_nested_tensor(video_frame_cls_tokens)
+        projected_nt_video = self.frame_to_video_projection(nt_video_frames)
+
+        # 2. Inject Video [CLS] Token
+        v_cls_token = self.video_cls_token.squeeze(0)  # (1, video_transformer_dim)
+        proj_video_list = projected_nt_video.unbind()
+        
+        video_input_list = [
+            torch.cat([v_cls_token, video_t], dim=0) 
+            for video_t in proj_video_list
+        ]
+        video_transformer_input_nt = torch.nested.as_nested_tensor(video_input_list)
+
+        # 3. Video Transformer Pass
+        # Dispatches to efficient SDPA, no padding mask needed
+        video_transformer_out = self.video_transformer(video_transformer_input_nt)
+
+        # 4. Extract class token and project
+        padded_video_out = video_transformer_out.to_padded_tensor(0.0)
+        video_cls_out = padded_video_out[:, 0, :]  # (num_videos, video_transformer_dim)
+
+        video_contrastive_embeddings = self.video_contrastive_projection(video_cls_out)
+
+        return RIDVideoOutput(
+            video_contrastive_embeddings=video_contrastive_embeddings,
+            video_cls_tokens=video_cls_out
+        )
+
+    def forward(self, video_embeddings: list[list[torch.Tensor]]) -> ReIDOutput:
+        device = video_embeddings[0][0].device
+
+        video_frame_transformer_output = self.embed_frames(video_embeddings, device)
+
+        video_transformer_output = self.embed_video_frames(
+            video_frame_transformer_output["video_frame_cls_tokens"],
+            device
+        )
+        
+        out = ReIDOutput(
+            **video_frame_transformer_output,
+            **video_transformer_output
+        )
+
+        return out

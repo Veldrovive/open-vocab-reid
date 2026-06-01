@@ -1,4 +1,4 @@
-epochs: 6
+epochs: 18
 batches_per_epoch: 300
 lr: 1.0e-4
 frame_loss_weight: 0.85
@@ -21,15 +21,16 @@ wandb_name: "large"
 wandb_entity: null
 no_wandb: false
 
+use_nested_tensors: false
 frame_transformer_dim: 1024
 frame_contrastive_dim: 256
 frame_num_heads: 8
-frame_num_layers: 4
+frame_num_layers: 5
 video_transformer_dim: 512
 video_contrastive_dim: 256
-video_num_heads: 8
-video_num_layers: 4
-dropout: 0.1
+video_num_heads: 4
+video_num_layers: 3
+dropout: 0.0
 
 # frame_transformer_dim: 256
 # frame_contrastive_dim: 256
@@ -46,7 +47,7 @@ duke:
   weight: 1.0
   frames_per_video: 8
   people_per_batch: 16
-  views_per_person: 3
+  views_per_person: 4
   use_for_eval: true
 
 whale:
@@ -59,6 +60,15 @@ whale:
   use_for_eval: true
 
 wildlife_subsets:
+  - subset_dataset: 'AerialCattle2017'
+    use_for_training: true
+    weight: 0.2
+    frames_per_video: 4
+    people_per_batch: 16
+    views_per_person: 2
+    min_num_images: 8
+    use_for_eval: true
+
   - subset_dataset: 'ATRW'
     use_for_training: true
     weight: 0.2
@@ -85,5 +95,33 @@ wildlife_subsets:
     views_per_person: 2
     min_num_images: 8
     use_for_eval: false
+
+  - subset_dataset: 'SeaTurtleID2022'
+    use_for_training: true
+    weight: 0.2
+    frames_per_video: 4
+    people_per_batch: 16
+    views_per_person: 2
+    min_num_images: 8
+    use_for_eval: true
+
+  - subset_dataset: 'NyalaData'
+    use_for_training: true
+    weight: 0.2
+    frames_per_video: 4
+    people_per_batch: 16
+    views_per_person: 2
+    min_num_images: 8
+    use_for_eval: false
+
+  # Test extrapolation by not training but doing eval
+  - subset_dataset: 'CZoo'
+    use_for_training: false
+    weight: 0.2
+    frames_per_video: 4
+    people_per_batch: 16
+    views_per_person: 2
+    min_num_images: 8
+    use_for_eval: true
 
     
