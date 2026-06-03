@@ -2,7 +2,7 @@ from dotenv import load_dotenv
 from pathlib import Path
 import os
 
-load_dotenv()
+load_dotenv(verbose=True, override=True)
 
 DUKEMTMC_VIDEO_REID_PATH = Path(os.getenv("DUKEMTMC_VIDEO_REID_PATH"))
 DUKEMTMC_VIDEO_REID_SIDECAR_PATH = Path(os.getenv("DUKEMTMC_VIDEO_REID_SIDECAR_PATH"))

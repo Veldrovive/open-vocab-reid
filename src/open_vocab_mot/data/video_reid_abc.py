@@ -28,6 +28,8 @@ class VideoReIDItem(NamedTuple):
     segmentation_path: Path | None
     segmentation_tensor: torch.Tensor | None
 
+    original_sequence_id: SequenceId | None = None
+
 class VideoReIDBatch(NamedTuple):
     sample_indices: Int[torch.Tensor, "b"]
     
@@ -41,6 +43,8 @@ class VideoReIDBatch(NamedTuple):
 
     segmentation_paths: list[Path] | list[None]
     segmentations: list[torch.Tensor] | list[None]
+
+    original_sequence_ids: Int[torch.Tensor, "b"] | None = None
 
 def collate_video_reid_ds(batch: list[VideoReIDItem]) -> VideoReIDBatch:
     sample_indices = torch.tensor([item.sample_index for item in batch], dtype=torch.long)
@@ -56,6 +60,12 @@ def collate_video_reid_ds(batch: list[VideoReIDItem]) -> VideoReIDBatch:
     segmentation_paths = [item.segmentation_path for item in batch]
     segmentations = [item.segmentation_tensor for item in batch]
     
+    original_seq_ids = [item.original_sequence_id for item in batch]
+    if any(s is not None for s in original_seq_ids):
+        original_sequence_ids = torch.tensor([s if s is not None else item.sequence_id for s, item in zip(original_seq_ids, batch)], dtype=torch.long)
+    else:
+        original_sequence_ids = None
+    
     return VideoReIDBatch(
         sample_indices=sample_indices,
         identity_ids=identity_ids, 
@@ -65,7 +75,8 @@ def collate_video_reid_ds(batch: list[VideoReIDItem]) -> VideoReIDBatch:
         frames=frames, 
         frame_tensors=frame_tensors, 
         segmentation_paths=segmentation_paths, 
-        segmentations=segmentations
+        segmentations=segmentations,
+        original_sequence_ids=original_sequence_ids
     )
 
 T_co = TypeVar('T_co', covariant=True)
@@ -421,7 +432,9 @@ class VideoReIDKPFBatchIterableDataset(IterableDataset[list[VideoReIDItem]]):
                         item = self.dataset[sample_idx]
                         if occurrence_idx > 0:
                             # _replace is built into Python NamedTuples for immutable updates
-                            item = item._replace(sequence_id=virtual_sequence_id)
+                            item = item._replace(sequence_id=virtual_sequence_id, original_sequence_id=sequence_id)
+                        else:
+                            item = item._replace(original_sequence_id=sequence_id)
                         batch_items.append(item)
 
             yield batch_items

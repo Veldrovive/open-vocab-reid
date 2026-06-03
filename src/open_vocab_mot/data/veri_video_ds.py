@@ -1,3 +1,9 @@
+"""
+The problem with VeRi is that the test is intended to be a single frame query. This is adjacent to the intended task, but not
+a video-reid. I should set up evaluation such that we can do the intended evaluation as well as using a video version where we
+just use all frames from the test as if they are from a video sequence.
+"""
+
 import os
 from pathlib import Path
 from enum import Enum
@@ -29,8 +35,10 @@ class VeRiVideoDataset(AbstractVideoReIDDataset):
         image_tensor_dtype: torch.dtype | None = None,
         load_segmentations: bool = False,
         verbose: bool = False,
+        collapse_sequences: bool = False,
     ):
         self.verbose = verbose
+        self.collapse_sequences = collapse_sequences
         self.load_image_pil = load_image_pil
         self.load_image_tensor = load_image_tensor
         self.load_segmentations = load_segmentations
@@ -127,20 +135,41 @@ class VeRiVideoDataset(AbstractVideoReIDDataset):
         for vehicle_id in sorted(temp_grouping.keys()):
             frames_by_person[vehicle_id] = {}
             sequence_map[vehicle_id] = {}
-            for camera_id in sorted(temp_grouping[vehicle_id].keys()):
+            
+            if self.collapse_sequences:
+                all_frames = []
+                for camera_id in temp_grouping[vehicle_id].keys():
+                    for frame_id, frame_name in temp_grouping[vehicle_id][camera_id]:
+                        all_frames.append((frame_id, frame_name, camera_id))
+                
                 # Sort frames chronologically by frame_id
-                sorted_frames = sorted(temp_grouping[vehicle_id][camera_id], key=lambda x: x[0])
+                sorted_frames = sorted(all_frames, key=lambda x: x[0])
                 frame_names = [x[1] for x in sorted_frames]
                 
-                frames_by_person[vehicle_id][camera_id] = frame_names
+                frames_by_person[vehicle_id][0] = frame_names
                 
                 start_idx = len(frame_list)
                 frame_list.extend(
-                    [(vehicle_id, camera_id, fname) for fname in frame_names]
+                    [(vehicle_id, camera_id, fname) for _, fname, camera_id in sorted_frames]
                 )
                 end_idx = len(frame_list)
                 
-                sequence_map[vehicle_id][camera_id] = list(range(start_idx, end_idx))
+                sequence_map[vehicle_id][0] = list(range(start_idx, end_idx))
+            else:
+                for camera_id in sorted(temp_grouping[vehicle_id].keys()):
+                    # Sort frames chronologically by frame_id
+                    sorted_frames = sorted(temp_grouping[vehicle_id][camera_id], key=lambda x: x[0])
+                    frame_names = [x[1] for x in sorted_frames]
+                    
+                    frames_by_person[vehicle_id][camera_id] = frame_names
+                    
+                    start_idx = len(frame_list)
+                    frame_list.extend(
+                        [(vehicle_id, camera_id, fname) for fname in frame_names]
+                    )
+                    end_idx = len(frame_list)
+                    
+                    sequence_map[vehicle_id][camera_id] = list(range(start_idx, end_idx))
                 
         return frames_by_person, frame_list, sequence_map
 
@@ -247,11 +276,12 @@ class VeRiVideoDataset(AbstractVideoReIDDataset):
         return VideoReIDItem(
             sample_index=index,
             identity_id=vehicle_id,
-            sequence_id=camera_id,
+            sequence_id=0 if self.collapse_sequences else camera_id,
             frame_id=frame_name,
             frame_path=frame_path,
             frame=image_pil,
             frame_tensor=image_tensor,
             segmentation_path=segmentation_path,
             segmentation_tensor=segmentation_tensor,
+            original_sequence_id=camera_id if self.collapse_sequences else None,
         )

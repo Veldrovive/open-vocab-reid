@@ -55,6 +55,54 @@ def _eval_task_collate_fn(batch):
     return identity_ids, sequence_ids, frames, segmentations
 
 
+def get_eval_identities_by_max_embeddings(
+    datasets: list[AbstractVideoReIDDataset],
+    num_video_embeddings_per_sequence: int,
+    max_embeddings: Optional[int],
+    seed: int = 42
+) -> Optional[set[IdentityId]]:
+    """
+    Finds a common subset of identities across multiple datasets such that the total number of
+    embeddings extracted across any of the datasets does not exceed `max_embeddings`.
+    """
+    if max_embeddings is None:
+        return None
+        
+    common_identities = set(datasets[0].unique_identities)
+    for ds in datasets[1:]:
+        common_identities.intersection_update(ds.unique_identities)
+        
+    rng = random.Random(seed)
+    common_identities_list = list(common_identities)
+    rng.shuffle(common_identities_list)
+    
+    selected_identities = set()
+    embeddings_count = [0] * len(datasets)
+    
+    for pid in common_identities_list:
+        pid_emb_counts = []
+        valid = True
+        for ds in datasets:
+            count = sum(1 for seq_indices in ds.sequence_map[pid].values() if len(seq_indices) > 0)
+            count *= num_video_embeddings_per_sequence
+            pid_emb_counts.append(count)
+            if count == 0:
+                valid = False
+                
+        if not valid:
+            continue
+            
+        will_exceed = any(c + pc > max_embeddings for c, pc in zip(embeddings_count, pid_emb_counts))
+        if will_exceed and len(selected_identities) > 0:
+            break
+            
+        selected_identities.add(pid)
+        for i in range(len(datasets)):
+            embeddings_count[i] += pid_emb_counts[i]
+            
+    return selected_identities
+
+
 @torch.no_grad()
 def extract_embeddings(
     dataset: AbstractVideoReIDDataset,
@@ -64,6 +112,7 @@ def extract_embeddings(
     num_video_embeddings_per_sequence: int,
     return_frame_embeddings: bool = False,
     max_frame_embeddings_per_sequence: Optional[int] = None,
+    target_identities: Optional[set[IdentityId]] = None,
     seed: int = 42,
     batch_size: int = 8,
     num_workers: int = 4
@@ -81,9 +130,14 @@ def extract_embeddings(
         print("Generating extraction tasks...")
 
     unique_identities = dataset.unique_identities
+    if target_identities is not None:
+        identities_to_process = [pid for pid in unique_identities if pid in target_identities]
+    else:
+        identities_to_process = unique_identities
+
     seq_map = dataset.sequence_map
 
-    for identity_id in unique_identities:
+    for identity_id in identities_to_process:
         for sequence_id, available_indices in seq_map[identity_id].items():
             if len(available_indices) == 0:
                 continue
@@ -181,7 +235,8 @@ def evaluate_reid(
     key_map: IdentityEmbeddingMap,
     same_source: bool,
     sim_aggregation: str = "max",
-    device: str = "cuda"
+    device: str = "cuda",
+    mode: str = "video"
 ) -> dict:
     """
     Evaluates Query vs Key IdentityEmbeddingMaps.
@@ -222,7 +277,7 @@ def evaluate_reid(
 
     N_Q = len(query_meta)
 
-    print("\n--- Standard Video-to-Video Evaluation (Standard CMC/mAP) ---")
+    print(f"\n--- Standard {mode.capitalize()}-to-{mode.capitalize()} Evaluation (Standard CMC/mAP) ---")
     cmc_video = torch.zeros(N_Q)
     ap_video = torch.zeros(N_Q)
     valid_queries_video = 0
@@ -295,7 +350,11 @@ def evaluate_reid(
             if person_mask.sum() == 0:
                 continue
 
-            person_sim = pairwise_sims[q_idx, person_mask].max().item()
+            if sim_aggregation == "mean":
+                person_sim = pairwise_sims[q_idx, person_mask].mean().item()
+            else:
+                person_sim = pairwise_sims[q_idx, person_mask].max().item()
+
             id_sims.append(person_sim)
             id_list.append(g_pid)
 
@@ -322,7 +381,7 @@ def evaluate_reid(
     return {
         "video": {
             "cmc": cmc_video,
-            "mAP": map_video,
+            "mAP": map_video.item() if isinstance(map_video, torch.Tensor) else map_video,
             "rank_1": cmc_video[0].item() if len(cmc_video) > 0 else 0,
             "rank_5": cmc_video[4].item() if len(cmc_video) > 4 else 0,
             "rank_10": cmc_video[9].item() if len(cmc_video) > 9 else 0
