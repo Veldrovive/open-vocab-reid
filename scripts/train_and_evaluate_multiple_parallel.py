@@ -60,7 +60,7 @@ from open_vocab_mot.losses import CircleLossWithUnknowns
 from open_vocab_mot.eval import extract_embeddings, evaluate_reid, get_eval_identities_by_max_embeddings
 
 
-def compute_batch_loss(batch, dino_harness, model, criterion, device, frame_loss_weight, dino_batch_split):
+def compute_batch_loss(batch, dino_harness, model, criterion, device, frame_loss_weight, cross_loss_weight, dino_batch_split):
     # 1. Extract DINO embeddings (Gradients disabled for DINO)
     with torch.no_grad():
         valid_imgs = []
@@ -147,9 +147,30 @@ def compute_batch_loss(batch, dino_harness, model, criterion, device, frame_loss
     frame_embeddings_out = torch.cat(reid_output["video_frame_contrastive_embeddings"], dim=0)
     frame_loss = criterion(frame_embeddings_out, frame_pos_mask, frame_neg_mask)
     
-    total_loss = (1.0 - frame_loss_weight) * video_loss + frame_loss_weight * frame_loss
+    mixed_embeddings = torch.cat([video_embeddings_out, frame_embeddings_out], dim=0)
+    mixed_pids = torch.cat([video_pids, frame_pids], dim=0)
     
-    return video_loss, frame_loss, total_loss
+    mixed_pos_mask = (mixed_pids.unsqueeze(0) == mixed_pids.unsqueeze(1))
+    mixed_neg_mask = ~mixed_pos_mask
+    mixed_pos_mask.fill_diagonal_(False)
+    mixed_neg_mask.fill_diagonal_(False)
+    
+    num_v = len(video_pids)
+    num_f = len(frame_pids)
+    
+    cross_mask = torch.ones((num_v + num_f, num_v + num_f), dtype=torch.bool, device=device)
+    cross_mask[:num_v, :num_v] = False
+    cross_mask[num_v:, num_v:] = False
+    
+    mixed_pos_mask = mixed_pos_mask & cross_mask
+    mixed_neg_mask = mixed_neg_mask & cross_mask
+    
+    cross_loss = criterion(mixed_embeddings, mixed_pos_mask, mixed_neg_mask)
+    
+    video_weight = 1.0 - frame_loss_weight - cross_loss_weight
+    total_loss = video_weight * video_loss + frame_loss_weight * frame_loss + cross_loss_weight * cross_loss
+    
+    return video_loss, frame_loss, cross_loss, total_loss
 
 
 class TrainConfig(BaseModel):
@@ -157,6 +178,7 @@ class TrainConfig(BaseModel):
     batches_per_epoch: int = 300
     lr: float = 1e-4
     frame_loss_weight: float = 0.85
+    cross_loss_weight: float = 0.05
     seed: int = 42
     dino_checkpoint: str = "facebook/dinov3-vitl16-pretrain-lvd1689m"
     dino_batch_split: int = 1
@@ -318,21 +340,33 @@ def run_mini_evaluation(epoch, args, model, dino_harness, criterion, device, acc
             loader = DataLoader(iterable_ds, batch_size=None, collate_fn=collate_video_reid_ds, num_workers=2)
             
             total_loss_sum = 0.0
+            total_cross_loss_sum = 0.0
+            total_video_loss_sum = 0.0
+            total_frame_loss_sum = 0.0
             count = 0
             for batch in loader:
                 with torch.no_grad():
-                    v_loss, f_loss, t_loss = compute_batch_loss(
+                    v_loss, f_loss, c_loss, t_loss = compute_batch_loss(
                         batch, dino_harness, model, criterion, device, 
-                        args.frame_loss_weight, args.dino_batch_split
+                        args.frame_loss_weight, args.cross_loss_weight, args.dino_batch_split
                     )
                 if t_loss is not None:
                     t_loss_gathered = accelerator.gather(t_loss.unsqueeze(0))
+                    c_loss_gathered = accelerator.gather(c_loss.unsqueeze(0))
+                    v_loss_gathered = accelerator.gather(v_loss.unsqueeze(0))
+                    f_loss_gathered = accelerator.gather(f_loss.unsqueeze(0))
                     total_loss_sum += t_loss_gathered.mean().item()
+                    total_cross_loss_sum += c_loss_gathered.mean().item()
+                    total_video_loss_sum += v_loss_gathered.mean().item()
+                    total_frame_loss_sum += f_loss_gathered.mean().item()
                     count += 1
                     
             if count > 0 and accelerator.is_main_process and not args.no_wandb:
                 wandb.log({
                     f"eval/{name}/loss": total_loss_sum / count,
+                    f"eval/{name}/cross_loss": total_cross_loss_sum / count,
+                    f"eval/{name}/video_loss": total_video_loss_sum / count,
+                    f"eval/{name}/frame_loss": total_frame_loss_sum / count,
                     "epoch": epoch + 1
                 })
                 
@@ -348,6 +382,7 @@ def run_mini_evaluation(epoch, args, model, dino_harness, criterion, device, acc
             
             metrics_video = None
             metrics_frame = None
+            metrics_cross = None
             if is_val:
                 val_ext = extract_embeddings(
                     dataset=ds_dict["val"], model=pipeline_model, accelerator=accelerator,
@@ -360,6 +395,8 @@ def run_mini_evaluation(epoch, args, model, dino_harness, criterion, device, acc
                         metrics_video = evaluate_reid(val_ext.video_embeddings, val_ext.video_embeddings, same_source=True, device=device, mode="video")
                     if cfg.use_for_frame_mini_eval:
                         metrics_frame = evaluate_reid(val_ext.frame_embeddings, val_ext.frame_embeddings, same_source=True, device=device, mode="frame")
+                    if cfg.use_for_video_mini_eval and cfg.use_for_frame_mini_eval:
+                        metrics_cross = evaluate_reid(val_ext.video_embeddings, val_ext.frame_embeddings, same_source=True, device=device, mode="cross")
             else:
                 q_ext = extract_embeddings(
                     dataset=ds_dict["query"], model=pipeline_model, accelerator=accelerator,
@@ -378,6 +415,8 @@ def run_mini_evaluation(epoch, args, model, dino_harness, criterion, device, acc
                         metrics_video = evaluate_reid(q_ext.video_embeddings, g_ext.video_embeddings, same_source=False, device=device, mode="video")
                     if cfg.use_for_frame_mini_eval:
                         metrics_frame = evaluate_reid(q_ext.frame_embeddings, g_ext.frame_embeddings, same_source=False, device=device, mode="frame")
+                    if cfg.use_for_video_mini_eval and cfg.use_for_frame_mini_eval:
+                        metrics_cross = evaluate_reid(q_ext.video_embeddings, g_ext.frame_embeddings, same_source=False, device=device, mode="cross")
                     
             if accelerator.is_main_process and not args.no_wandb:
                 if metrics_video:
@@ -390,6 +429,12 @@ def run_mini_evaluation(epoch, args, model, dino_harness, criterion, device, acc
                     wandb.log({
                         f"eval/{name}/mini_frame_mAP": metrics_frame["video"]["mAP"],
                         f"eval/{name}/mini_frame_rank_1": metrics_frame["video"]["rank_1"],
+                        "epoch": epoch + 1
+                    })
+                if metrics_cross:
+                    wandb.log({
+                        f"eval/{name}/mini_cross_mAP": metrics_cross["video"]["mAP"],
+                        f"eval/{name}/mini_cross_rank_1": metrics_cross["video"]["rank_1"],
                         "epoch": epoch + 1
                     })
 
@@ -594,6 +639,7 @@ def main(cfg: DictConfig):
     for name in dataset_names:
         history[f"{name}_video_loss"] = []
         history[f"{name}_frame_loss"] = []
+        history[f"{name}_cross_loss"] = []
         history[f"{name}_total_loss"] = []
     
     eval_datasets_cache = {}
@@ -620,9 +666,9 @@ def main(cfg: DictConfig):
                 break
                 
             # 1-5. Compute Losses via helper
-            video_loss, frame_loss, total_loss = compute_batch_loss(
+            video_loss, frame_loss, cross_loss, total_loss = compute_batch_loss(
                 batch, dino_harness, model, criterion, device, 
-                args.frame_loss_weight, args.dino_batch_split
+                args.frame_loss_weight, args.cross_loss_weight, args.dino_batch_split
             )
             
             if total_loss is None:
@@ -637,6 +683,7 @@ def main(cfg: DictConfig):
             if accelerator.is_main_process:
                 history[f"{selected_ds_name}_video_loss"].append(video_loss.item())
                 history[f"{selected_ds_name}_frame_loss"].append(frame_loss.item())
+                history[f"{selected_ds_name}_cross_loss"].append(cross_loss.item())
                 history[f"{selected_ds_name}_total_loss"].append(total_loss.item())
                 history["total_loss"].append(total_loss.item())
                 
@@ -645,6 +692,7 @@ def main(cfg: DictConfig):
                         "train/loss": total_loss.item(),
                         f"train/{selected_ds_name}/video_loss": video_loss.item(),
                         f"train/{selected_ds_name}/frame_loss": frame_loss.item(),
+                        f"train/{selected_ds_name}/cross_loss": cross_loss.item(),
                         f"train/{selected_ds_name}/loss": total_loss.item(),
                         "epoch": epoch + 1,
                         "batch": batch_idx,
@@ -654,7 +702,7 @@ def main(cfg: DictConfig):
                 
                 if batch_idx % 10 == 0:
                     print(f"Batch {batch_idx} [{selected_ds_name}]: Total Loss = {total_loss.item():.4f} "
-                          f"(Video: {video_loss.item():.4f}, Frame: {frame_loss.item():.4f})")
+                          f"(Video: {video_loss.item():.4f}, Frame: {frame_loss.item():.4f}, Cross: {cross_loss.item():.4f})")
                 
                 # Update progress bar
                 progress.update(1)
@@ -754,6 +802,7 @@ def main(cfg: DictConfig):
                 print(f"\nRunning metrics computation for {name}...")
                 eval_metrics_video = None
                 eval_metrics_frame = None
+                eval_metrics_cross = None
                 if cfg.use_for_video_eval:
                     eval_metrics_video = evaluate_reid(
                         query_map=val_extraction.video_embeddings,
@@ -771,6 +820,15 @@ def main(cfg: DictConfig):
                         sim_aggregation="max",
                         device=device,
                         mode="frame"
+                    )
+                if cfg.use_for_video_eval and cfg.use_for_frame_eval:
+                    eval_metrics_cross = evaluate_reid(
+                        query_map=val_extraction.video_embeddings,
+                        key_map=val_extraction.frame_embeddings,
+                        same_source=True,
+                        sim_aggregation="max",
+                        device=device,
+                        mode="cross"
                     )
         else:
             if accelerator.is_main_process:
@@ -805,6 +863,7 @@ def main(cfg: DictConfig):
                 print(f"\nRunning metrics computation for {name}...")
                 eval_metrics_video = None
                 eval_metrics_frame = None
+                eval_metrics_cross = None
                 if cfg.use_for_video_eval:
                     eval_metrics_video = evaluate_reid(
                         query_map=query_extraction.video_embeddings,
@@ -822,6 +881,15 @@ def main(cfg: DictConfig):
                         sim_aggregation="max",
                         device=device,
                         mode="frame"
+                    )
+                if cfg.use_for_video_eval and cfg.use_for_frame_eval:
+                    eval_metrics_cross = evaluate_reid(
+                        query_map=query_extraction.video_embeddings,
+                        key_map=gallery_extraction.frame_embeddings,
+                        same_source=False,
+                        sim_aggregation="max",
+                        device=device,
+                        mode="cross"
                     )
 
         if accelerator.is_main_process and not args.no_wandb:
@@ -845,6 +913,16 @@ def main(cfg: DictConfig):
                     f"eval/{name}/frame_identity_rank_1": eval_metrics_frame["identity"]["rank_1"],
                     f"eval/{name}/frame_identity_rank_5": eval_metrics_frame["identity"]["rank_5"],
                     f"eval/{name}/frame_identity_rank_10": eval_metrics_frame["identity"]["rank_10"],
+                })
+            if eval_metrics_cross:
+                logs.update({
+                    f"eval/{name}/cross_rank_1": eval_metrics_cross["video"]["rank_1"],
+                    f"eval/{name}/cross_rank_5": eval_metrics_cross["video"]["rank_5"],
+                    f"eval/{name}/cross_rank_10": eval_metrics_cross["video"]["rank_10"],
+                    f"eval/{name}/cross_mAP": eval_metrics_cross["video"]["mAP"],
+                    f"eval/{name}/cross_identity_rank_1": eval_metrics_cross["identity"]["rank_1"],
+                    f"eval/{name}/cross_identity_rank_5": eval_metrics_cross["identity"]["rank_5"],
+                    f"eval/{name}/cross_identity_rank_10": eval_metrics_cross["identity"]["rank_10"],
                 })
             if logs:
                 wandb.log(logs)

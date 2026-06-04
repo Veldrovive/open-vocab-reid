@@ -1,7 +1,8 @@
 epochs: 10
 batches_per_epoch: 500
 lr: 1.0e-4
-frame_loss_weight: 0.85
+frame_loss_weight: 0.5
+cross_loss_weight: 0.35
 seed: 42
 dino_checkpoint: "facebook/dinov3-vitl16-pretrain-lvd1689m"
 dino_batch_split: 4
@@ -21,7 +22,7 @@ mini_eval_max_frame_embeddings: 1
 eval_batch_size: 32
 
 wandb_project: "open-vocab-mot-tests"
-wandb_name: "large"
+wandb_name: "cross-loss"
 wandb_entity: null
 no_wandb: false
 run_initial_mini_eval: true
@@ -151,8 +152,8 @@ wildlife_subsets:
     people_per_batch: 16
     views_per_person: 2
     min_num_images: 8
-    use_for_video_eval: true
-    use_for_video_mini_eval: true
+    use_for_video_eval: false
+    use_for_video_mini_eval: false
     use_for_frame_eval: false
     use_for_frame_mini_eval: false
 
