@@ -8,16 +8,13 @@ from torchvision.io import read_image, ImageReadMode
 from PIL import Image
 from tqdm import tqdm
 
-from open_vocab_mot.data.video_reid_abc import AbstractVideoReIDDataset, VideoReIDItem, IdentityId, SequenceId
+from open_vocab_mot.data.video_reid_abc import AbstractVideoReIDDataset, VideoReIDItem, IdentityId, SequenceId, DatasetSplit
 
 VRAIPersonId = int
 VRAICameraId = int
 VRAIFrameName = str
 
-class VRAISplit(Enum):
-    TRAIN = 0
-    QUERY = 1
-    GALLERY = 2
+
 
 class VRAITestSet(Enum):
     DEV = 0
@@ -27,7 +24,7 @@ class VRAIDataset(AbstractVideoReIDDataset):
     def __init__(
         self,
         ds_root: Path | str,
-        main_split: VRAISplit,
+        main_split: DatasetSplit,
         test_set: VRAITestSet = VRAITestSet.FULL,
         sidecar_root: Path | str | None = None,
         load_image_pil: bool = False,
@@ -82,8 +79,8 @@ class VRAIDataset(AbstractVideoReIDDataset):
         }
 
         self.train_frame_map, self.train_frame_list, self.train_sequence_map = self._process_train_frames(verbose=self.verbose)
-        self.query_frame_map, self.query_frame_list, self.query_sequence_map = self._process_test_frames(VRAISplit.QUERY, self.test_annotations, verbose=self.verbose)
-        self.gallery_frame_map, self.gallery_frame_list, self.gallery_sequence_map = self._process_test_frames(VRAISplit.GALLERY, self.test_annotations, verbose=self.verbose)
+        self.query_frame_map, self.query_frame_list, self.query_sequence_map = self._process_test_frames(DatasetSplit.QUERY, self.test_annotations, verbose=self.verbose)
+        self.gallery_frame_map, self.gallery_frame_list, self.gallery_sequence_map = self._process_test_frames(DatasetSplit.GALLERY, self.test_annotations, verbose=self.verbose)
 
     def _process_train_frames(self, verbose: bool = False) -> tuple[
         dict[VRAIPersonId, dict[VRAICameraId, list[VRAIFrameName]]], 
@@ -131,7 +128,7 @@ class VRAIDataset(AbstractVideoReIDDataset):
                     
         return frames_by_person, frame_list, sequence_map
 
-    def _process_test_frames(self, split: VRAISplit, annotations: dict[str, int], verbose: bool = False) -> tuple[
+    def _process_test_frames(self, split: DatasetSplit, annotations: dict[str, int], verbose: bool = False) -> tuple[
         dict[VRAIPersonId, dict[VRAICameraId, list[VRAIFrameName]]], 
         list[tuple[VRAIPersonId, VRAICameraId, VRAIFrameName]],
         dict[IdentityId, dict[SequenceId, list[int]]]
@@ -141,7 +138,7 @@ class VRAIDataset(AbstractVideoReIDDataset):
         sequence_map: dict[IdentityId, dict[SequenceId, list[int]]] = {}
         
         # Query == 1, Gallery == 0
-        target_val = 1 if split == VRAISplit.QUERY else 0
+        target_val = 1 if split == DatasetSplit.QUERY else 0
         
         grouped_frames = {}
         for frame_name, is_query in annotations.items():
@@ -187,11 +184,11 @@ class VRAIDataset(AbstractVideoReIDDataset):
 
     @property
     def sequence_map(self) -> dict[IdentityId, dict[SequenceId, list[int]]]:
-        if self.main_split == VRAISplit.TRAIN:
+        if self.main_split == DatasetSplit.TRAIN:
             return self.train_sequence_map
-        elif self.main_split == VRAISplit.QUERY:
+        elif self.main_split == DatasetSplit.QUERY:
             return self.query_sequence_map
-        elif self.main_split == VRAISplit.GALLERY:
+        elif self.main_split == DatasetSplit.GALLERY:
             return self.gallery_sequence_map
         else:
             raise ValueError(f"Invalid split: {self.main_split}")
@@ -199,32 +196,32 @@ class VRAIDataset(AbstractVideoReIDDataset):
     # --- Internal Properties & Loaders ---
 
     @property
-    def frame_list(self, split: VRAISplit | None = None) -> list[tuple[VRAIPersonId, VRAICameraId, VRAIFrameName]]:
+    def frame_list(self, split: DatasetSplit | None = None) -> list[tuple[VRAIPersonId, VRAICameraId, VRAIFrameName]]:
         split = split or self.main_split
-        if split == VRAISplit.TRAIN:
+        if split == DatasetSplit.TRAIN:
             return self.train_frame_list
-        elif split == VRAISplit.QUERY:
+        elif split == DatasetSplit.QUERY:
             return self.query_frame_list
-        elif split == VRAISplit.GALLERY:
+        elif split == DatasetSplit.GALLERY:
             return self.gallery_frame_list
         else:
             raise ValueError(f"Invalid split: {split}")
 
     @property
-    def frame_map(self, split: VRAISplit | None = None) -> dict[VRAIPersonId, dict[VRAICameraId, list[VRAIFrameName]]]:
+    def frame_map(self, split: DatasetSplit | None = None) -> dict[VRAIPersonId, dict[VRAICameraId, list[VRAIFrameName]]]:
         split = split or self.main_split
-        if split == VRAISplit.TRAIN:
+        if split == DatasetSplit.TRAIN:
             return self.train_frame_map
-        elif split == VRAISplit.QUERY:
+        elif split == DatasetSplit.QUERY:
             return self.query_frame_map
-        elif split == VRAISplit.GALLERY:
+        elif split == DatasetSplit.GALLERY:
             return self.gallery_frame_map
         else:
             raise ValueError(f"Invalid split: {split}")
 
-    def _get_frame_path(self, unique_person_id: VRAIPersonId, camera_id: VRAICameraId, frame_name: VRAIFrameName, split: VRAISplit | None = None) -> Path | None:
+    def _get_frame_path(self, unique_person_id: VRAIPersonId, camera_id: VRAICameraId, frame_name: VRAIFrameName, split: DatasetSplit | None = None) -> Path | None:
         split = split or self.main_split
-        if split == VRAISplit.TRAIN:
+        if split == DatasetSplit.TRAIN:
             frame_path = self.images_train_path / frame_name
         else:
             frame_path = self.images_dev_path / frame_name
@@ -234,11 +231,11 @@ class VRAIDataset(AbstractVideoReIDDataset):
             return None
         return frame_path
 
-    def _load_frame_pil(self, unique_person_id: VRAIPersonId, camera_id: VRAICameraId, frame_name: VRAIFrameName, split: VRAISplit | None = None) -> Image.Image | None:
+    def _load_frame_pil(self, unique_person_id: VRAIPersonId, camera_id: VRAICameraId, frame_name: VRAIFrameName, split: DatasetSplit | None = None) -> Image.Image | None:
         frame_path = self._get_frame_path(unique_person_id, camera_id, frame_name, split)
         return Image.open(frame_path) if frame_path is not None else None
 
-    def _load_frame_tensor(self, unique_person_id: VRAIPersonId, camera_id: VRAICameraId, frame_name: VRAIFrameName, split: VRAISplit | None = None) -> torch.Tensor | None:
+    def _load_frame_tensor(self, unique_person_id: VRAIPersonId, camera_id: VRAICameraId, frame_name: VRAIFrameName, split: DatasetSplit | None = None) -> torch.Tensor | None:
         frame_path = self._get_frame_path(unique_person_id, camera_id, frame_name, split)
         if frame_path is None:
             return None
@@ -250,12 +247,12 @@ class VRAIDataset(AbstractVideoReIDDataset):
             frame_tensor = frame_tensor.float() / 255.0
         return frame_tensor
 
-    def _get_segmentation_path(self, unique_person_id: VRAIPersonId, camera_id: VRAICameraId, frame_name: VRAIFrameName, split: VRAISplit | None = None) -> Path | None:
+    def _get_segmentation_path(self, unique_person_id: VRAIPersonId, camera_id: VRAICameraId, frame_name: VRAIFrameName, split: DatasetSplit | None = None) -> Path | None:
         frame_path = self._get_frame_path(unique_person_id, camera_id, frame_name, split)
         if frame_path is None or self.sidecar_root is None:
             return None
         
-        relative_parent_path = Path("images_train") if (split or self.main_split) == VRAISplit.TRAIN else Path("images_dev")
+        relative_parent_path = Path("images_train") if (split or self.main_split) == DatasetSplit.TRAIN else Path("images_dev")
         segmentation_path = self.sidecar_root / relative_parent_path / f"{frame_path.stem}_major_mask.png"
         
         if not segmentation_path.exists():
@@ -263,7 +260,7 @@ class VRAIDataset(AbstractVideoReIDDataset):
             return None
         return segmentation_path
 
-    def _load_segmentation_tensor(self, unique_person_id: VRAIPersonId, camera_id: VRAICameraId, frame_name: VRAIFrameName, split: VRAISplit | None = None) -> torch.Tensor | None:
+    def _load_segmentation_tensor(self, unique_person_id: VRAIPersonId, camera_id: VRAICameraId, frame_name: VRAIFrameName, split: DatasetSplit | None = None) -> torch.Tensor | None:
         segmentation_path = self._get_segmentation_path(unique_person_id, camera_id, frame_name, split)
         if segmentation_path is None:
             return None

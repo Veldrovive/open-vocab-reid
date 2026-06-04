@@ -7,22 +7,17 @@ from torchvision.io import read_image, ImageReadMode
 from PIL import Image
 from tqdm import tqdm
 
-from open_vocab_mot.data.video_reid_abc import AbstractVideoReIDDataset, VideoReIDItem, IdentityId, SequenceId
+from open_vocab_mot.data.video_reid_abc import AbstractVideoReIDDataset, VideoReIDItem, IdentityId, SequenceId, DatasetSplit
 
 DukePersonId = int
 DukeCameraId = int
 DukeFrameName = str
 
-class DukeSplit(Enum):
-    TRAIN = 0
-    QUERY = 1
-    GALLERY = 2
-
 class DukeMTMCVideoDataset(AbstractVideoReIDDataset):
     def __init__(
         self,
         ds_root: Path | str,
-        main_split: DukeSplit,
+        main_split: DatasetSplit,
         sidecar_root: Path | str | None = None,
         load_image_pil: bool = False,
         load_image_tensor: bool = False,
@@ -58,17 +53,17 @@ class DukeMTMCVideoDataset(AbstractVideoReIDDataset):
         assert self.gallery_path.exists(), f"Duke MTMC Video Dataset gallery folder {self.gallery_path} does not exist."
 
         self.main_split = main_split
-        self.split_paths: dict[DukeSplit, Path] = {
-            DukeSplit.TRAIN: self.train_path,
-            DukeSplit.QUERY: self.query_path,
-            DukeSplit.GALLERY: self.gallery_path,
+        self.split_paths: dict[DatasetSplit, Path] = {
+            DatasetSplit.TRAIN: self.train_path,
+            DatasetSplit.QUERY: self.query_path,
+            DatasetSplit.GALLERY: self.gallery_path,
         }
 
-        self.train_frame_map, self.train_frame_list, self.train_sequence_map = self._process_frames(DukeSplit.TRAIN, verbose=self.verbose)
-        self.query_frame_map, self.query_frame_list, self.query_sequence_map = self._process_frames(DukeSplit.QUERY, verbose=self.verbose)
-        self.gallery_frame_map, self.gallery_frame_list, self.gallery_sequence_map = self._process_frames(DukeSplit.GALLERY, verbose=self.verbose)
+        self.train_frame_map, self.train_frame_list, self.train_sequence_map = self._process_frames(DatasetSplit.TRAIN, verbose=self.verbose)
+        self.query_frame_map, self.query_frame_list, self.query_sequence_map = self._process_frames(DatasetSplit.QUERY, verbose=self.verbose)
+        self.gallery_frame_map, self.gallery_frame_list, self.gallery_sequence_map = self._process_frames(DatasetSplit.GALLERY, verbose=self.verbose)
 
-    def _process_frames(self, split: DukeSplit | None = None, verbose: bool = False) -> tuple[
+    def _process_frames(self, split: DatasetSplit | None = None, verbose: bool = False) -> tuple[
         dict[DukePersonId, dict[DukeCameraId, list[DukeFrameName]]], 
         list[tuple[DukePersonId, DukeCameraId, DukeFrameName]],
         dict[IdentityId, dict[SequenceId, list[int]]]
@@ -127,11 +122,11 @@ class DukeMTMCVideoDataset(AbstractVideoReIDDataset):
 
     @property
     def sequence_map(self) -> dict[IdentityId, dict[SequenceId, list[int]]]:
-        if self.main_split == DukeSplit.TRAIN:
+        if self.main_split == DatasetSplit.TRAIN:
             return self.train_sequence_map
-        elif self.main_split == DukeSplit.QUERY:
+        elif self.main_split == DatasetSplit.QUERY:
             return self.query_sequence_map
-        elif self.main_split == DukeSplit.GALLERY:
+        elif self.main_split == DatasetSplit.GALLERY:
             return self.gallery_sequence_map
         else:
             raise ValueError(f"Invalid split: {self.main_split}")
@@ -139,30 +134,30 @@ class DukeMTMCVideoDataset(AbstractVideoReIDDataset):
     # --- Internal Properties & Loaders ---
 
     @property
-    def frame_list(self, split: DukeSplit | None = None) -> list[tuple[DukePersonId, DukeCameraId, DukeFrameName]]:
+    def frame_list(self, split: DatasetSplit | None = None) -> list[tuple[DukePersonId, DukeCameraId, DukeFrameName]]:
         split = split or self.main_split
-        if split == DukeSplit.TRAIN:
+        if split == DatasetSplit.TRAIN:
             return self.train_frame_list
-        elif split == DukeSplit.QUERY:
+        elif split == DatasetSplit.QUERY:
             return self.query_frame_list
-        elif split == DukeSplit.GALLERY:
+        elif split == DatasetSplit.GALLERY:
             return self.gallery_frame_list
         else:
             raise ValueError(f"Invalid split: {split}")
 
     @property
-    def frame_map(self, split: DukeSplit | None = None) -> dict[DukePersonId, dict[DukeCameraId, list[DukeFrameName]]]:
+    def frame_map(self, split: DatasetSplit | None = None) -> dict[DukePersonId, dict[DukeCameraId, list[DukeFrameName]]]:
         split = split or self.main_split
-        if split == DukeSplit.TRAIN:
+        if split == DatasetSplit.TRAIN:
             return self.train_frame_map
-        elif split == DukeSplit.QUERY:
+        elif split == DatasetSplit.QUERY:
             return self.query_frame_map
-        elif split == DukeSplit.GALLERY:
+        elif split == DatasetSplit.GALLERY:
             return self.gallery_frame_map
         else:
             raise ValueError(f"Invalid split: {split}")
 
-    def _get_frame_path(self, unique_person_id: DukePersonId, camera_id: DukeCameraId, frame_name: DukeFrameName, split: DukeSplit | None = None) -> Path | None:
+    def _get_frame_path(self, unique_person_id: DukePersonId, camera_id: DukeCameraId, frame_name: DukeFrameName, split: DatasetSplit | None = None) -> Path | None:
         split = split or self.main_split
         person_folder_name = f"{unique_person_id:04d}"
         camera_folder_name = f"{camera_id:04d}"
@@ -176,11 +171,11 @@ class DukeMTMCVideoDataset(AbstractVideoReIDDataset):
             return None
         return frame_path
 
-    def _load_frame_pil(self, unique_person_id: DukePersonId, camera_id: DukeCameraId, frame_name: DukeFrameName, split: DukeSplit | None = None) -> Image.Image | None:
+    def _load_frame_pil(self, unique_person_id: DukePersonId, camera_id: DukeCameraId, frame_name: DukeFrameName, split: DatasetSplit | None = None) -> Image.Image | None:
         frame_path = self._get_frame_path(unique_person_id, camera_id, frame_name, split)
         return Image.open(frame_path) if frame_path is not None else None
 
-    def _load_frame_tensor(self, unique_person_id: DukePersonId, camera_id: DukeCameraId, frame_name: DukeFrameName, split: DukeSplit | None = None) -> torch.Tensor | None:
+    def _load_frame_tensor(self, unique_person_id: DukePersonId, camera_id: DukeCameraId, frame_name: DukeFrameName, split: DatasetSplit | None = None) -> torch.Tensor | None:
         frame_path = self._get_frame_path(unique_person_id, camera_id, frame_name, split)
         if frame_path is None:
             return None
@@ -192,7 +187,7 @@ class DukeMTMCVideoDataset(AbstractVideoReIDDataset):
             frame_tensor = frame_tensor.float() / 255.0
         return frame_tensor
 
-    def _get_segmentation_path(self, unique_person_id: DukePersonId, camera_id: DukeCameraId, frame_name: DukeFrameName, split: DukeSplit | None = None) -> Path | None:
+    def _get_segmentation_path(self, unique_person_id: DukePersonId, camera_id: DukeCameraId, frame_name: DukeFrameName, split: DatasetSplit | None = None) -> Path | None:
         frame_path = self._get_frame_path(unique_person_id, camera_id, frame_name, split)
         if frame_path is None:
             return None
@@ -205,7 +200,7 @@ class DukeMTMCVideoDataset(AbstractVideoReIDDataset):
             return None
         return segmentation_path
 
-    def _load_segmentation_tensor(self, unique_person_id: DukePersonId, camera_id: DukeCameraId, frame_name: DukeFrameName, split: DukeSplit | None = None) -> torch.Tensor | None:
+    def _load_segmentation_tensor(self, unique_person_id: DukePersonId, camera_id: DukeCameraId, frame_name: DukeFrameName, split: DatasetSplit | None = None) -> torch.Tensor | None:
         segmentation_path = self._get_segmentation_path(unique_person_id, camera_id, frame_name, split)
         if segmentation_path is None:
             return None

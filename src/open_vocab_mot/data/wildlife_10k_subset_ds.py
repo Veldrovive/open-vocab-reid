@@ -16,7 +16,7 @@ from PIL import Image
 from tqdm import tqdm
 
 from wildlife_datasets import datasets
-from open_vocab_mot.data.video_reid_abc import AbstractVideoReIDDataset, VideoReIDItem, IdentityId, SequenceId
+from open_vocab_mot.data.video_reid_abc import AbstractVideoReIDDataset, VideoReIDItem, IdentityId, SequenceId, DatasetSplit
 
 Wildlife10KDatasets = Literal[
     'AAUZebraFish', 'AerialCattle2017',
@@ -40,10 +40,7 @@ Wildlife10KDatasets = Literal[
     'ZindiTurtleRecall'
 ]
 
-class Wildlife10KSplit(Enum):
-    TRAIN = 0
-    VAL = 1
-    TEST = 2
+
 
 class Wildlife10KSubsetDataset(AbstractVideoReIDDataset):
     ds: datasets.WildlifeReID10k
@@ -52,7 +49,7 @@ class Wildlife10KSubsetDataset(AbstractVideoReIDDataset):
         self,
         ds_root: Path | str,
         dataset_name: Wildlife10KDatasets,
-        split: Wildlife10KSplit,
+        split: DatasetSplit,
         sidecar_root: Path | str | None = None,
         load_image_pil: bool = False,
         load_image_tensor: bool = False,
@@ -128,16 +125,14 @@ class Wildlife10KSubsetDataset(AbstractVideoReIDDataset):
         rng.shuffle(unique_train_identities)
 
         val_split_idx = int(len(unique_train_identities) * (1 - self.val_split_frac))
-        if self.split == Wildlife10KSplit.TRAIN:
+        if self.split == DatasetSplit.TRAIN:
             train_identities = unique_train_identities[:val_split_idx]
             df = train_df[train_df['identity'].isin(train_identities)].copy()
-        elif self.split == Wildlife10KSplit.VAL:
+        elif self.split == DatasetSplit.VAL:
             val_identities = unique_train_identities[val_split_idx:]
             df = train_df[train_df['identity'].isin(val_identities)].copy()
-        elif self.split == Wildlife10KSplit.TEST:
-            df = test_df
         else:
-            raise ValueError(f"Invalid split: {self.split}")
+            raise ValueError(f"Invalid split for Wildlife10KSubsetDataset: {self.split}")
 
         # All identities are strings. We map them to indices
         unique_id_strings = df['identity'].unique()

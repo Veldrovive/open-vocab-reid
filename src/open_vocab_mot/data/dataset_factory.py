@@ -2,12 +2,12 @@ import torch
 from pydantic import BaseModel, ConfigDict
 from typing import Optional, Literal, Tuple, Dict, Any, List
 
-from open_vocab_mot.data.whale_ds import WhaleDataset, WhaleSplit
-from open_vocab_mot.data.duke_mtmc_video_ds import DukeMTMCVideoDataset, DukeSplit
-from open_vocab_mot.data.wildlife_10k_subset_ds import Wildlife10KSubsetDataset, Wildlife10KSplit, Wildlife10KDatasets
-from open_vocab_mot.data.veri_video_ds import VeRiVideoDataset, VeRiSplit
-from open_vocab_mot.data.vrai_ds import VRAIDataset, VRAISplit
-from open_vocab_mot.data.video_reid_abc import VideoReIDKPFBatchIterableDataset, AbstractVideoReIDDataset
+from open_vocab_mot.data.whale_ds import WhaleDataset
+from open_vocab_mot.data.duke_mtmc_video_ds import DukeMTMCVideoDataset
+from open_vocab_mot.data.wildlife_10k_subset_ds import Wildlife10KSubsetDataset, Wildlife10KDatasets
+from open_vocab_mot.data.veri_video_ds import VeRiVideoDataset
+from open_vocab_mot.data.vrai_ds import VRAIDataset
+from open_vocab_mot.data.video_reid_abc import VideoReIDKPFBatchIterableDataset, AbstractVideoReIDDataset, DatasetSplit
 
 from open_vocab_mot.definitions import (
     DUKEMTMC_VIDEO_REID_PATH, 
@@ -23,6 +23,12 @@ from open_vocab_mot.definitions import (
 )
 
 
+class EvalTaskConfig(BaseModel):
+    query_source: Literal["val", "query"]
+    query_modality: Literal["frame", "video"]
+    gallery_source: Literal["val", "gallery"]
+    gallery_modality: Literal["frame", "video"]
+
 class DatasetConfig(BaseModel):
     model_config = ConfigDict(extra="allow")
 
@@ -31,10 +37,8 @@ class DatasetConfig(BaseModel):
     frames_per_video: int = 4
     people_per_batch: int = 16
     views_per_person: int = 3
-    use_for_video_eval: bool = False
-    use_for_video_mini_eval: bool = False
-    use_for_frame_eval: bool = False
-    use_for_frame_mini_eval: bool = False
+    eval_tasks: list[EvalTaskConfig] = []
+    mini_eval_tasks: list[EvalTaskConfig] = []
 
 class DukeDatasetConfig(DatasetConfig):
     pass
@@ -60,12 +64,12 @@ def load_dataset_for_training(
     verbose: bool = False
 ) -> VideoReIDKPFBatchIterableDataset:
     
-    kwargs = config.model_dump(exclude={"use_for_training", "weight", "frames_per_video", "people_per_batch", "views_per_person", "use_for_video_eval", "use_for_video_mini_eval", "use_for_frame_eval", "use_for_frame_mini_eval", "subset_dataset", "min_num_images"}, exclude_unset=True, exclude_none=True)
+    kwargs = config.model_dump(exclude={"use_for_training", "weight", "frames_per_video", "people_per_batch", "views_per_person", "eval_tasks", "mini_eval_tasks", "subset_dataset", "min_num_images"}, exclude_unset=True, exclude_none=True)
     
     if dataset_type == "duke":
         ds = DukeMTMCVideoDataset(
             ds_root=DUKEMTMC_VIDEO_REID_PATH,
-            main_split=DukeSplit.TRAIN,
+            main_split=DatasetSplit.TRAIN,
             sidecar_root=DUKEMTMC_VIDEO_REID_SIDECAR_PATH,
             load_image_pil=False,
             load_image_tensor=True,
@@ -77,7 +81,7 @@ def load_dataset_for_training(
         # config is a WhaleDatasetConfig
         ds = WhaleDataset(
             ds_root=WHALE_DATASET_PATH,
-            split=WhaleSplit.TRAIN,
+            split=DatasetSplit.TRAIN,
             sidecar_root=WHALE_DATASET_SIDECAR_PATH,
             load_image_pil=False,
             load_image_tensor=True,
@@ -90,7 +94,7 @@ def load_dataset_for_training(
         ds = Wildlife10KSubsetDataset(
             ds_root=WILDLIFE_10K_PATH,
             dataset_name=getattr(config, "subset_dataset"),
-            split=Wildlife10KSplit.TRAIN,
+            split=DatasetSplit.TRAIN,
             sidecar_root=WILDLIFE_10K_SIDECAR_PATH,
             load_image_pil=False,
             load_image_tensor=True,
@@ -104,7 +108,7 @@ def load_dataset_for_training(
         kwargs.pop("collapse_sequences", None)
         ds = VeRiVideoDataset(
             ds_root=VERI_DATASET_PATH,
-            main_split=VeRiSplit.TRAIN,
+            main_split=DatasetSplit.TRAIN,
             sidecar_root=VERI_DATASET_SIDECAR_PATH,
             load_image_pil=False,
             load_image_tensor=True,
@@ -116,7 +120,7 @@ def load_dataset_for_training(
     elif dataset_type == "vrai":
         ds = VRAIDataset(
             ds_root=VRAI_DATASET_PATH,
-            main_split=VRAISplit.TRAIN,
+            main_split=DatasetSplit.TRAIN,
             sidecar_root=VRAI_DATASET_SIDECAR_PATH,
             load_image_pil=False,
             load_image_tensor=True,
@@ -146,12 +150,12 @@ def load_dataset_for_eval(
     config: DatasetConfig,
     verbose: bool = False
 ) -> Dict[str, AbstractVideoReIDDataset]:
-    kwargs = config.model_dump(exclude={"use_for_training", "weight", "frames_per_video", "people_per_batch", "views_per_person", "use_for_video_eval", "use_for_video_mini_eval", "use_for_frame_eval", "use_for_frame_mini_eval", "subset_dataset", "min_num_images"}, exclude_unset=True, exclude_none=True)
+    kwargs = config.model_dump(exclude={"use_for_training", "weight", "frames_per_video", "people_per_batch", "views_per_person", "eval_tasks", "mini_eval_tasks", "subset_dataset", "min_num_images"}, exclude_unset=True, exclude_none=True)
     
     if dataset_type == "duke":
         query_ds = DukeMTMCVideoDataset(
             ds_root=DUKEMTMC_VIDEO_REID_PATH,
-            main_split=DukeSplit.QUERY,
+            main_split=DatasetSplit.QUERY,
             sidecar_root=DUKEMTMC_VIDEO_REID_SIDECAR_PATH,
             load_image_pil=False,
             load_image_tensor=True,
@@ -161,7 +165,7 @@ def load_dataset_for_eval(
         )
         gallery_ds = DukeMTMCVideoDataset(
             ds_root=DUKEMTMC_VIDEO_REID_PATH,
-            main_split=DukeSplit.GALLERY,
+            main_split=DatasetSplit.GALLERY,
             sidecar_root=DUKEMTMC_VIDEO_REID_SIDECAR_PATH,
             load_image_pil=False,
             load_image_tensor=True,
@@ -174,7 +178,7 @@ def load_dataset_for_eval(
     elif dataset_type == "whale":
         val_ds = WhaleDataset(
             ds_root=WHALE_DATASET_PATH,
-            split=WhaleSplit.VAL,
+            split=DatasetSplit.VAL,
             sidecar_root=WHALE_DATASET_SIDECAR_PATH,
             load_image_pil=False,
             load_image_tensor=True,
@@ -189,7 +193,7 @@ def load_dataset_for_eval(
         val_ds = Wildlife10KSubsetDataset(
             ds_root=WILDLIFE_10K_PATH,
             dataset_name=getattr(config, "subset_dataset"),
-            split=Wildlife10KSplit.VAL,
+            split=DatasetSplit.VAL,
             sidecar_root=WILDLIFE_10K_SIDECAR_PATH,
             load_image_pil=False,
             load_image_tensor=True,
@@ -206,7 +210,7 @@ def load_dataset_for_eval(
         kwargs.pop("collapse_sequences", None)
         query_ds = VeRiVideoDataset(
             ds_root=VERI_DATASET_PATH,
-            main_split=VeRiSplit.QUERY,
+            main_split=DatasetSplit.QUERY,
             sidecar_root=VERI_DATASET_SIDECAR_PATH,
             load_image_pil=False,
             load_image_tensor=True,
@@ -217,7 +221,7 @@ def load_dataset_for_eval(
         )
         gallery_ds = VeRiVideoDataset(
             ds_root=VERI_DATASET_PATH,
-            main_split=VeRiSplit.GALLERY,
+            main_split=DatasetSplit.GALLERY,
             sidecar_root=VERI_DATASET_SIDECAR_PATH,
             load_image_pil=False,
             load_image_tensor=True,
@@ -229,9 +233,9 @@ def load_dataset_for_eval(
         return {"query": query_ds, "gallery": gallery_ds}
         
     elif dataset_type == "vrai":
-        val_ds = VRAIDataset(
+        query_ds = VRAIDataset(
             ds_root=VRAI_DATASET_PATH,
-            main_split=VRAISplit.QUERY,
+            main_split=DatasetSplit.QUERY,
             sidecar_root=VRAI_DATASET_SIDECAR_PATH,
             load_image_pil=False,
             load_image_tensor=True,
@@ -239,7 +243,17 @@ def load_dataset_for_eval(
             verbose=verbose,
             **kwargs
         )
-        return {"val": val_ds}
+        gallery_ds = VRAIDataset(
+            ds_root=VRAI_DATASET_PATH,
+            main_split=DatasetSplit.GALLERY,
+            sidecar_root=VRAI_DATASET_SIDECAR_PATH,
+            load_image_pil=False,
+            load_image_tensor=True,
+            load_segmentations=True,
+            verbose=verbose,
+            **kwargs
+        )
+        return {"query": query_ds, "gallery": gallery_ds}
         
     else:
         raise ValueError(f"Unknown dataset type {dataset_type}")

@@ -14,6 +14,13 @@ IdentityId = int
 SequenceId = int
 FrameId = str
 
+from enum import Enum
+class DatasetSplit(str, Enum):
+    TRAIN = "train"
+    VAL = "val"
+    QUERY = "query"
+    GALLERY = "gallery"
+
 class VideoReIDItem(NamedTuple):
     sample_index: int
 
