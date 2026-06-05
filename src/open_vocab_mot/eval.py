@@ -26,7 +26,7 @@ class IdentityEmbeddingMap:
 
 @dataclass
 class ExtractionResult:
-    video_embeddings: IdentityEmbeddingMap
+    video_embeddings: Optional[IdentityEmbeddingMap] = None
     frame_embeddings: Optional[IdentityEmbeddingMap] = None
 
 
@@ -110,6 +110,7 @@ def extract_embeddings(
     accelerator: Accelerator,
     frames_per_video_embedding: int,
     num_video_embeddings_per_sequence: int,
+    return_video_embeddings: bool = True,
     return_frame_embeddings: bool = False,
     max_frame_embeddings_per_sequence: Optional[int] = None,
     target_identities: Optional[set[IdentityId]] = None,
@@ -143,20 +144,21 @@ def extract_embeddings(
                 continue
 
             # --- Video Tasks ---
-            rng = random.Random(seed + identity_id + sequence_id)
-            pool = list(available_indices)
-            rng.shuffle(pool)
+            if return_video_embeddings:
+                rng = random.Random(seed + identity_id + sequence_id)
+                pool = list(available_indices)
+                rng.shuffle(pool)
 
-            for _ in range(num_video_embeddings_per_sequence):
-                selected = []
-                while len(selected) < frames_per_video_embedding:
-                    if not pool:
-                        pool = list(available_indices)
-                        rng.shuffle(pool)
-                    needed = frames_per_video_embedding - len(selected)
-                    selected.extend(pool[:needed])
-                    pool = pool[needed:]
-                video_tasks.append((identity_id, sequence_id, selected))
+                for _ in range(num_video_embeddings_per_sequence):
+                    selected = []
+                    while len(selected) < frames_per_video_embedding:
+                        if not pool:
+                            pool = list(available_indices)
+                            rng.shuffle(pool)
+                        needed = frames_per_video_embedding - len(selected)
+                        selected.extend(pool[:needed])
+                        pool = pool[needed:]
+                    video_tasks.append((identity_id, sequence_id, selected))
 
             # --- Frame Tasks ---
             if return_frame_embeddings:
@@ -201,15 +203,21 @@ def extract_embeddings(
             # Since we extract either video or frame
             if extract_video:
                 emb_batch = output["video_contrastive_embeddings"]
+                if emb_batch is None or emb_batch.shape[0] == 0:
+                    continue
+                emb_batch = emb_batch.cpu()
+                for i in range(len(identity_ids)):
+                    if i < emb_batch.shape[0]:
+                        local_results.append((identity_ids[i], sequence_ids[i], emb_batch[i]))
             else:
-                # If extract_frames, since each task is 1 frame, we get 1 frame embedding per video task
-                emb_batch = [f_embs[0] for f_embs in output["frame_contrastive_embeddings"]]
-                emb_batch = torch.stack(emb_batch)
-                
-            emb_batch = emb_batch.cpu()
-            
-            for i in range(len(identity_ids)):
-                local_results.append((identity_ids[i], sequence_ids[i], emb_batch[i]))
+                frame_embs = output["frame_contrastive_embeddings"]
+                if frame_embs is None or len(frame_embs) == 0:
+                    continue
+                for i in range(len(identity_ids)):
+                    if i < len(frame_embs):
+                        f_embs = frame_embs[i]
+                        if len(f_embs) > 0:
+                            local_results.append((identity_ids[i], sequence_ids[i], f_embs[0].cpu()))
                 
         # Gather across GPUs
         gathered_results = gather_object([local_results])
@@ -221,7 +229,10 @@ def extract_embeddings(
                 
         return final_map
 
-    video_map = process_tasks(video_tasks, "Extracting Video Embeddings", extract_video=True, extract_frames=False)
+    video_map = None
+    if return_video_embeddings:
+        video_map = process_tasks(video_tasks, "Extracting Video Embeddings", extract_video=True, extract_frames=False)
+        
     frame_map = None
     if return_frame_embeddings:
         frame_map = process_tasks(frame_tasks, "Extracting Frame Embeddings", extract_video=False, extract_frames=True)
@@ -276,9 +287,10 @@ def evaluate_reid(
     k_eidx = torch.tensor([meta[2] for meta in key_meta])
 
     N_Q = len(query_meta)
+    N_G = len(key_meta)
 
     print(f"\n--- Standard {mode.capitalize()}-to-{mode.capitalize()} Evaluation (Standard CMC/mAP) ---")
-    cmc_video = torch.zeros(N_Q)
+    cmc_video = torch.zeros(N_G)
     ap_video = torch.zeros(N_Q)
     valid_queries_video = 0
 
@@ -326,7 +338,7 @@ def evaluate_reid(
 
     print("\n--- Person-to-Identity Evaluation (Max over gallery videos) ---")
     gallery_people = sorted(list(set(k_pids.tolist())))
-    cmc_identity = torch.zeros(N_Q)
+    cmc_identity = torch.zeros(len(gallery_people))
     valid_queries_identity = 0
 
     for q_idx in range(N_Q):

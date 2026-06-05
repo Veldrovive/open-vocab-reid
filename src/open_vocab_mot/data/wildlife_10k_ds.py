@@ -9,14 +9,13 @@ from PIL import Image
 from tqdm import tqdm
 
 from wildlife_datasets import datasets
-from open_vocab_mot.data.video_reid_abc import AbstractVideoReIDDataset, VideoReIDItem, IdentityId, SequenceId
-from open_vocab_mot.data.wildlife_10k_subset_ds import Wildlife10KSplit
+from open_vocab_mot.data.video_reid_abc import AbstractVideoReIDDataset, VideoReIDItem, IdentityId, SequenceId, DatasetSplit
 
 class Wildlife10kDataset(AbstractVideoReIDDataset):
     def __init__(
         self,
         ds_root: Path | str,
-        split: Wildlife10KSplit | None = None,
+        split: DatasetSplit | None = None,
         sidecar_root: Path | str | None = None,
         load_image_pil: bool = False,
         load_image_tensor: bool = False,
@@ -79,15 +78,15 @@ class Wildlife10kDataset(AbstractVideoReIDDataset):
             rng = np.random.default_rng(self.val_split_seed)
             rng.shuffle(unique_identities)
             val_split_idx = int(len(unique_identities) * (1-self.val_split_frac))
-            if self.split == Wildlife10KSplit.TRAIN:
+            if self.split == DatasetSplit.TRAIN:
                 train_val_df = df[df['split'] == 'train'].copy()
                 train_identities = unique_identities[:val_split_idx]
                 df = train_val_df[train_val_df['identity'].isin(train_identities)].copy()
-            elif self.split == Wildlife10KSplit.VAL:
+            elif self.split == DatasetSplit.VAL:
                 train_val_df = df[df['split'] == 'train'].copy()
                 val_identities = unique_identities[val_split_idx:]
                 df = train_val_df[train_val_df['identity'].isin(val_identities)].copy()
-            elif self.split == Wildlife10KSplit.TEST:
+            elif self.split in (DatasetSplit.QUERY, DatasetSplit.GALLERY):
                 df = df[df['split'] == 'test'].copy()
             else:
                 raise ValueError(f"Invalid split: {self.split}")

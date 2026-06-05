@@ -77,6 +77,10 @@ class WhaleDataset(AbstractVideoReIDDataset):
         # To split between train and val, we find the set of identities, shuffle it using a seeded shuffle
         # and then split it
         unique_identities = df['identity'].unique()
+        if hasattr(unique_identities, 'to_numpy'):
+            unique_identities = unique_identities.to_numpy()
+        else:
+            unique_identities = np.array(unique_identities)
         rng = np.random.default_rng(self.val_split_seed)
         rng.shuffle(unique_identities)
         val_split_idx = int(len(unique_identities) * (1-self.val_split_frac))

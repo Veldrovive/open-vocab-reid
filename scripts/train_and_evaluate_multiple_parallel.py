@@ -278,6 +278,102 @@ def combined_collate_fn(data):
     return collate_video_reid_ds(batch_items), dataset_name
 
 
+def _run_evaluation_tasks(
+    name, cfg, tasks, ds_dict, pipeline_model, accelerator, device, args, epoch, is_mini, eval_prefix, max_frame_embeddings
+):
+    if len(tasks) == 0:
+        return
+        
+    # Figure out which sources and modalities need extracting
+    sources_to_extract = {"val": {"video": False, "frame": False}, "query": {"video": False, "frame": False}, "gallery": {"video": False, "frame": False}}
+    
+    for task in tasks:
+        if task.query_source in sources_to_extract:
+            sources_to_extract[task.query_source][task.query_modality] = True
+        if task.gallery_source in sources_to_extract:
+            sources_to_extract[task.gallery_source][task.gallery_modality] = True
+
+    datasets_for_target_ids = [ds for ds_name, ds in ds_dict.items() if ds_name in ["val", "query", "gallery"]]
+    target_ids = get_eval_identities_by_max_embeddings(
+        datasets=datasets_for_target_ids,
+        num_video_embeddings_per_sequence=args.num_embeddings,
+        max_embeddings=args.eval_max_embeddings,
+        seed=args.seed
+    )
+
+    extractions = {}
+    for source in ["val", "query", "gallery"]:
+        if source in ds_dict:
+            need_video = sources_to_extract[source]["video"]
+            need_frame = sources_to_extract[source]["frame"]
+            if need_video or need_frame:
+                if accelerator.is_main_process:
+                    print(f"\nProcessing {name} {source.capitalize()} Dataset...")
+                
+                source_target_ids = target_ids if is_mini else None
+                
+                extractions[source] = extract_embeddings(
+                    dataset=ds_dict[source],
+                    model=pipeline_model,
+                    accelerator=accelerator,
+                    frames_per_video_embedding=cfg.frames_per_video,
+                    num_video_embeddings_per_sequence=args.num_embeddings,
+                    return_video_embeddings=need_video,
+                    return_frame_embeddings=need_frame,
+                    max_frame_embeddings_per_sequence=max_frame_embeddings,
+                    target_identities=source_target_ids,
+                    seed=args.seed,
+                    batch_size=args.eval_batch_size
+                )
+                
+    if accelerator.is_main_process:
+        print(f"\nRunning metrics computation for {name}...")
+        
+    for task in tasks:
+        if task.query_source not in extractions or task.gallery_source not in extractions:
+            continue
+            
+        q_ext = extractions[task.query_source]
+        g_ext = extractions[task.gallery_source]
+        
+        q_map = q_ext.video_embeddings if task.query_modality == "video" else q_ext.frame_embeddings
+        g_map = g_ext.video_embeddings if task.gallery_modality == "video" else g_ext.frame_embeddings
+        
+        if q_map is None or g_map is None:
+            continue
+            
+        same_source = (task.query_source == task.gallery_source)
+        mode = f"{task.query_modality}_to_{task.gallery_modality}"
+        
+        if accelerator.is_main_process:
+            metrics = evaluate_reid(
+                query_map=q_map,
+                key_map=g_map,
+                same_source=same_source,
+                sim_aggregation="max",
+                device=device,
+                mode=mode
+            )
+            
+            if not args.no_wandb and metrics:
+                prefix = f"eval/{name}/{eval_prefix}{mode}"
+                logs = {
+                    f"{prefix}_rank_1": metrics["video"]["rank_1"],
+                    f"{prefix}_mAP": metrics["video"]["mAP"],
+                }
+                if not is_mini:
+                    logs.update({
+                        f"{prefix}_rank_5": metrics["video"]["rank_5"],
+                        f"{prefix}_rank_10": metrics["video"]["rank_10"],
+                        f"{prefix}_identity_rank_1": metrics["identity"]["rank_1"],
+                        f"{prefix}_identity_rank_5": metrics["identity"]["rank_5"],
+                        f"{prefix}_identity_rank_10": metrics["identity"]["rank_10"],
+                    })
+                if is_mini:
+                    logs["epoch"] = epoch + 1
+                    
+                wandb.log(logs)
+
 def run_mini_evaluation(epoch, args, model, dino_harness, criterion, device, accelerator, eval_datasets_cache):
     if not args.compute_eval_loss and not args.compute_eval_accuracy:
         return
@@ -304,26 +400,26 @@ def run_mini_evaluation(epoch, args, model, dino_harness, criterion, device, acc
         return eval_datasets_cache[name]
         
     eval_configs = []
-    if args.duke.use_for_video_mini_eval or args.duke.use_for_frame_mini_eval:
-        eval_configs.append(("duke", args.duke, "duke", False))
-    if args.whale.use_for_video_mini_eval or args.whale.use_for_frame_mini_eval:
-        eval_configs.append(("whale", args.whale, "whale", True))
+    eval_configs.append(("duke", args.duke, "duke"))
+    eval_configs.append(("whale", args.whale, "whale"))
     for subset_cfg in args.wildlife_subsets:
-        if subset_cfg.use_for_video_mini_eval or subset_cfg.use_for_frame_mini_eval:
-            eval_configs.append((subset_cfg.subset_dataset, subset_cfg, "wildlife10k_subset", True))
-    if args.veri.use_for_video_mini_eval or args.veri.use_for_frame_mini_eval:
-        eval_configs.append(("veri", args.veri, "veri", False))
-    if args.vrai.use_for_video_mini_eval or args.vrai.use_for_frame_mini_eval:
-        eval_configs.append(("vrai", args.vrai, "vrai", True))
+        eval_configs.append((subset_cfg.subset_dataset, subset_cfg, "wildlife10k_subset"))
+    eval_configs.append(("veri", args.veri, "veri"))
+    eval_configs.append(("vrai", args.vrai, "vrai"))
     
-    for name, cfg, dtype, is_val in eval_configs:
+    for name, cfg, dtype in eval_configs:
+        tasks = cfg.mini_eval_tasks
+        if len(tasks) == 0:
+            continue
+            
         ds_dict = get_ds(name, dtype, cfg)
-        datasets = [ds_dict["val"]] if is_val else [ds_dict["query"], ds_dict["gallery"]]
         
         if args.compute_eval_loss:
             if accelerator.is_main_process:
                 print(f"Computing mini validation loss for {name}...")
-            target_ds = ds_dict["val"] if is_val else ds_dict["gallery"]
+            # Just grab the first available dataset for computing loss (usually val or gallery)
+            target_ds = ds_dict.get("val", ds_dict.get("gallery", list(ds_dict.values())[0]))
+            
             iterable_ds = VideoReIDKPFBatchIterableDataset(
                 target_ds,
                 batches_per_epoch=args.eval_loss_batches,
@@ -373,70 +469,13 @@ def run_mini_evaluation(epoch, args, model, dino_harness, criterion, device, acc
         if args.compute_eval_accuracy:
             if accelerator.is_main_process:
                 print(f"Computing mini validation accuracy for {name}...")
-            target_ids = get_eval_identities_by_max_embeddings(
-                datasets=datasets,
-                num_video_embeddings_per_sequence=args.num_embeddings,
-                max_embeddings=args.eval_max_embeddings,
-                seed=args.seed
+                
+            _run_evaluation_tasks(
+                name=name, cfg=cfg, tasks=tasks, ds_dict=ds_dict,
+                pipeline_model=pipeline_model, accelerator=accelerator, device=device,
+                args=args, epoch=epoch, is_mini=True, eval_prefix="mini_", 
+                max_frame_embeddings=args.mini_eval_max_frame_embeddings
             )
-            
-            metrics_video = None
-            metrics_frame = None
-            metrics_cross = None
-            if is_val:
-                val_ext = extract_embeddings(
-                    dataset=ds_dict["val"], model=pipeline_model, accelerator=accelerator,
-                    frames_per_video_embedding=cfg.frames_per_video, num_video_embeddings_per_sequence=args.num_embeddings,
-                    return_frame_embeddings=cfg.use_for_frame_mini_eval, max_frame_embeddings_per_sequence=args.mini_eval_max_frame_embeddings,
-                    target_identities=target_ids, seed=args.seed, batch_size=args.eval_batch_size
-                )
-                if accelerator.is_main_process:
-                    if cfg.use_for_video_mini_eval:
-                        metrics_video = evaluate_reid(val_ext.video_embeddings, val_ext.video_embeddings, same_source=True, device=device, mode="video")
-                    if cfg.use_for_frame_mini_eval:
-                        metrics_frame = evaluate_reid(val_ext.frame_embeddings, val_ext.frame_embeddings, same_source=True, device=device, mode="frame")
-                    if cfg.use_for_video_mini_eval and cfg.use_for_frame_mini_eval:
-                        metrics_cross = evaluate_reid(val_ext.video_embeddings, val_ext.frame_embeddings, same_source=True, device=device, mode="cross")
-            else:
-                q_ext = extract_embeddings(
-                    dataset=ds_dict["query"], model=pipeline_model, accelerator=accelerator,
-                    frames_per_video_embedding=cfg.frames_per_video, num_video_embeddings_per_sequence=args.num_embeddings,
-                    return_frame_embeddings=cfg.use_for_frame_mini_eval, max_frame_embeddings_per_sequence=args.mini_eval_max_frame_embeddings,
-                    target_identities=target_ids, seed=args.seed, batch_size=args.eval_batch_size
-                )
-                g_ext = extract_embeddings(
-                    dataset=ds_dict["gallery"], model=pipeline_model, accelerator=accelerator,
-                    frames_per_video_embedding=cfg.frames_per_video, num_video_embeddings_per_sequence=args.num_embeddings,
-                    return_frame_embeddings=cfg.use_for_frame_mini_eval, max_frame_embeddings_per_sequence=args.mini_eval_max_frame_embeddings,
-                    target_identities=target_ids, seed=args.seed, batch_size=args.eval_batch_size
-                )
-                if accelerator.is_main_process:
-                    if cfg.use_for_video_mini_eval:
-                        metrics_video = evaluate_reid(q_ext.video_embeddings, g_ext.video_embeddings, same_source=False, device=device, mode="video")
-                    if cfg.use_for_frame_mini_eval:
-                        metrics_frame = evaluate_reid(q_ext.frame_embeddings, g_ext.frame_embeddings, same_source=False, device=device, mode="frame")
-                    if cfg.use_for_video_mini_eval and cfg.use_for_frame_mini_eval:
-                        metrics_cross = evaluate_reid(q_ext.video_embeddings, g_ext.frame_embeddings, same_source=False, device=device, mode="cross")
-                    
-            if accelerator.is_main_process and not args.no_wandb:
-                if metrics_video:
-                    wandb.log({
-                        f"eval/{name}/mini_video_mAP": metrics_video["video"]["mAP"],
-                        f"eval/{name}/mini_video_rank_1": metrics_video["video"]["rank_1"],
-                        "epoch": epoch + 1
-                    })
-                if metrics_frame:
-                    wandb.log({
-                        f"eval/{name}/mini_frame_mAP": metrics_frame["video"]["mAP"],
-                        f"eval/{name}/mini_frame_rank_1": metrics_frame["video"]["rank_1"],
-                        "epoch": epoch + 1
-                    })
-                if metrics_cross:
-                    wandb.log({
-                        f"eval/{name}/mini_cross_mAP": metrics_cross["video"]["mAP"],
-                        f"eval/{name}/mini_cross_rank_1": metrics_cross["video"]["rank_1"],
-                        "epoch": epoch + 1
-                    })
 
 
 @hydra.main(version_base=None, config_path="../configs/train_and_evaluate_multiple", config_name="config")
@@ -757,19 +796,18 @@ def main(cfg: DictConfig):
     )
     
     eval_configs = []
-    if args.duke.use_for_video_eval or args.duke.use_for_frame_eval:
-        eval_configs.append(("duke", args.duke, "duke", False))
-    if args.whale.use_for_video_eval or args.whale.use_for_frame_eval:
-        eval_configs.append(("whale", args.whale, "whale", True))
+    eval_configs.append(("duke", args.duke, "duke"))
+    eval_configs.append(("whale", args.whale, "whale"))
     for subset_cfg in args.wildlife_subsets:
-        if subset_cfg.use_for_video_eval or subset_cfg.use_for_frame_eval:
-            eval_configs.append((subset_cfg.subset_dataset, subset_cfg, "wildlife10k_subset", True))
-    if args.veri.use_for_video_eval or args.veri.use_for_frame_eval:
-        eval_configs.append(("veri", args.veri, "veri", False))
-    if args.vrai.use_for_video_eval or args.vrai.use_for_frame_eval:
-        eval_configs.append(("vrai", args.vrai, "vrai", True))
+        eval_configs.append((subset_cfg.subset_dataset, subset_cfg, "wildlife10k_subset"))
+    eval_configs.append(("veri", args.veri, "veri"))
+    eval_configs.append(("vrai", args.vrai, "vrai"))
 
-    for name, cfg, dtype, is_val in eval_configs:
+    for name, cfg, dtype in eval_configs:
+        tasks = cfg.eval_tasks
+        if len(tasks) == 0:
+            continue
+            
         if name not in eval_datasets_cache:
             if accelerator.is_main_process:
                 print(f"\nLoading {name} test sets for evaluation...")
@@ -783,150 +821,13 @@ def main(cfg: DictConfig):
                 print(f"\nUsing cached {name} test sets for evaluation...")
         ds_dict = eval_datasets_cache[name]
         
-        if is_val:
-            if accelerator.is_main_process:
-                print(f"\nProcessing {name} Validation Dataset...")
-            val_extraction = extract_embeddings(
-                dataset=ds_dict["val"],
-                model=pipeline_model,
-                accelerator=accelerator,
-                frames_per_video_embedding=cfg.frames_per_video,
-                num_video_embeddings_per_sequence=args.num_embeddings,
-                return_frame_embeddings=cfg.use_for_frame_eval,
-                max_frame_embeddings_per_sequence=None,
-                seed=args.seed,
-                batch_size=args.eval_batch_size,
-            )
-            
-            if accelerator.is_main_process:
-                print(f"\nRunning metrics computation for {name}...")
-                eval_metrics_video = None
-                eval_metrics_frame = None
-                eval_metrics_cross = None
-                if cfg.use_for_video_eval:
-                    eval_metrics_video = evaluate_reid(
-                        query_map=val_extraction.video_embeddings,
-                        key_map=val_extraction.video_embeddings,
-                        same_source=True,
-                        sim_aggregation="max",
-                        device=device,
-                        mode="video"
-                    )
-                if cfg.use_for_frame_eval:
-                    eval_metrics_frame = evaluate_reid(
-                        query_map=val_extraction.frame_embeddings,
-                        key_map=val_extraction.frame_embeddings,
-                        same_source=True,
-                        sim_aggregation="max",
-                        device=device,
-                        mode="frame"
-                    )
-                if cfg.use_for_video_eval and cfg.use_for_frame_eval:
-                    eval_metrics_cross = evaluate_reid(
-                        query_map=val_extraction.video_embeddings,
-                        key_map=val_extraction.frame_embeddings,
-                        same_source=True,
-                        sim_aggregation="max",
-                        device=device,
-                        mode="cross"
-                    )
-        else:
-            if accelerator.is_main_process:
-                print(f"\nProcessing {name} Query Dataset...")
-            query_extraction = extract_embeddings(
-                dataset=ds_dict["query"],
-                model=pipeline_model,
-                accelerator=accelerator,
-                frames_per_video_embedding=cfg.frames_per_video,
-                num_video_embeddings_per_sequence=args.num_embeddings,
-                return_frame_embeddings=cfg.use_for_frame_eval,
-                max_frame_embeddings_per_sequence=None,
-                seed=args.seed,
-                batch_size=args.eval_batch_size,
-            )
-            
-            if accelerator.is_main_process:
-                print(f"\nProcessing {name} Gallery Dataset...")
-            gallery_extraction = extract_embeddings(
-                dataset=ds_dict["gallery"],
-                model=pipeline_model,
-                accelerator=accelerator,
-                frames_per_video_embedding=cfg.frames_per_video,
-                num_video_embeddings_per_sequence=args.num_embeddings,
-                return_frame_embeddings=cfg.use_for_frame_eval,
-                max_frame_embeddings_per_sequence=None,
-                seed=args.seed,
-                batch_size=args.eval_batch_size,
-            )
-            
-            if accelerator.is_main_process:
-                print(f"\nRunning metrics computation for {name}...")
-                eval_metrics_video = None
-                eval_metrics_frame = None
-                eval_metrics_cross = None
-                if cfg.use_for_video_eval:
-                    eval_metrics_video = evaluate_reid(
-                        query_map=query_extraction.video_embeddings,
-                        key_map=gallery_extraction.video_embeddings,
-                        same_source=False,
-                        sim_aggregation="max",
-                        device=device,
-                        mode="video"
-                    )
-                if cfg.use_for_frame_eval:
-                    eval_metrics_frame = evaluate_reid(
-                        query_map=query_extraction.frame_embeddings,
-                        key_map=gallery_extraction.frame_embeddings,
-                        same_source=False,
-                        sim_aggregation="max",
-                        device=device,
-                        mode="frame"
-                    )
-                if cfg.use_for_video_eval and cfg.use_for_frame_eval:
-                    eval_metrics_cross = evaluate_reid(
-                        query_map=query_extraction.video_embeddings,
-                        key_map=gallery_extraction.frame_embeddings,
-                        same_source=False,
-                        sim_aggregation="max",
-                        device=device,
-                        mode="cross"
-                    )
-
-        if accelerator.is_main_process and not args.no_wandb:
-            logs = {}
-            if eval_metrics_video:
-                logs.update({
-                    f"eval/{name}/video_rank_1": eval_metrics_video["video"]["rank_1"],
-                    f"eval/{name}/video_rank_5": eval_metrics_video["video"]["rank_5"],
-                    f"eval/{name}/video_rank_10": eval_metrics_video["video"]["rank_10"],
-                    f"eval/{name}/video_mAP": eval_metrics_video["video"]["mAP"],
-                    f"eval/{name}/identity_rank_1": eval_metrics_video["identity"]["rank_1"],
-                    f"eval/{name}/identity_rank_5": eval_metrics_video["identity"]["rank_5"],
-                    f"eval/{name}/identity_rank_10": eval_metrics_video["identity"]["rank_10"],
-                })
-            if eval_metrics_frame:
-                logs.update({
-                    f"eval/{name}/frame_rank_1": eval_metrics_frame["video"]["rank_1"],
-                    f"eval/{name}/frame_rank_5": eval_metrics_frame["video"]["rank_5"],
-                    f"eval/{name}/frame_rank_10": eval_metrics_frame["video"]["rank_10"],
-                    f"eval/{name}/frame_mAP": eval_metrics_frame["video"]["mAP"],
-                    f"eval/{name}/frame_identity_rank_1": eval_metrics_frame["identity"]["rank_1"],
-                    f"eval/{name}/frame_identity_rank_5": eval_metrics_frame["identity"]["rank_5"],
-                    f"eval/{name}/frame_identity_rank_10": eval_metrics_frame["identity"]["rank_10"],
-                })
-            if eval_metrics_cross:
-                logs.update({
-                    f"eval/{name}/cross_rank_1": eval_metrics_cross["video"]["rank_1"],
-                    f"eval/{name}/cross_rank_5": eval_metrics_cross["video"]["rank_5"],
-                    f"eval/{name}/cross_rank_10": eval_metrics_cross["video"]["rank_10"],
-                    f"eval/{name}/cross_mAP": eval_metrics_cross["video"]["mAP"],
-                    f"eval/{name}/cross_identity_rank_1": eval_metrics_cross["identity"]["rank_1"],
-                    f"eval/{name}/cross_identity_rank_5": eval_metrics_cross["identity"]["rank_5"],
-                    f"eval/{name}/cross_identity_rank_10": eval_metrics_cross["identity"]["rank_10"],
-                })
-            if logs:
-                wandb.log(logs)
-            
+        _run_evaluation_tasks(
+            name=name, cfg=cfg, tasks=tasks, ds_dict=ds_dict,
+            pipeline_model=pipeline_model, accelerator=accelerator, device=device,
+            args=args, epoch=-1, is_mini=False, eval_prefix="", 
+            max_frame_embeddings=None
+        )
+        
         accelerator.wait_for_everyone()
 
     if accelerator.is_main_process and not args.no_wandb:
