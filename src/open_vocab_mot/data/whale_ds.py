@@ -5,6 +5,8 @@ import numpy as np
 
 import torch
 from torchvision.io import read_image, ImageReadMode
+from torchvision import tv_tensors
+from typing import Callable, Any
 from PIL import Image
 from tqdm import tqdm
 
@@ -25,7 +27,8 @@ class WhaleDataset(AbstractVideoReIDDataset):
         verbose: bool = False,
         min_num_images: int = 0,
         val_split_frac: float = 0.2,
-        val_split_seed: int = 42
+        val_split_seed: int = 42,
+        transform: Callable | None = None,
     ):
         self.ds_root = Path(ds_root)
         if sidecar_root is not None:
@@ -43,6 +46,7 @@ class WhaleDataset(AbstractVideoReIDDataset):
         self.split = split
         self.val_split_frac = val_split_frac
         self.val_split_seed = val_split_seed
+        self.transform = transform
 
         if self.load_segmentations:
             assert self.sidecar_root is not None, "WhaleDataset sidecar root must be specified for loading segmentations."
@@ -192,6 +196,19 @@ class WhaleDataset(AbstractVideoReIDDataset):
                 segmentation_tensor = read_image(str(segmentation_path), ImageReadMode.GRAY)
                 # Normalize segmentation masks to [0, 1] if needed
                 segmentation_tensor = segmentation_tensor.float() / 255.0
+
+        if self.transform is not None:
+            if image_tensor is not None:
+                image_tensor = tv_tensors.Image(image_tensor)
+            if segmentation_tensor is not None:
+                segmentation_tensor = tv_tensors.Mask(segmentation_tensor)
+            
+            if image_tensor is not None and segmentation_tensor is not None:
+                image_tensor, segmentation_tensor = self.transform(image_tensor, segmentation_tensor)
+            elif image_tensor is not None:
+                image_tensor = self.transform(image_tensor)
+            elif segmentation_tensor is not None:
+                segmentation_tensor = self.transform(segmentation_tensor)
 
         return VideoReIDItem(
             sample_index=index,

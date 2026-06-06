@@ -19,13 +19,27 @@ compute_eval_accuracy: true
 eval_loss_batches: 15
 eval_max_embeddings: 1000
 mini_eval_max_frame_embeddings: 1
-eval_batch_size: 32
+eval_batch_size: 16
 
 wandb_project: "open-vocab-mot-tests"
 wandb_name: "new-eval"
 wandb_entity: null
 no_wandb: false
 run_initial_mini_eval: true
+
+# enable_augmentations: true
+# crop_ratio_range: [0.9, 1.0]
+augmentation_config:
+  enable: false
+  crop_ratio_range: [0.9, 1.0]
+  random_flip_prop: 0.5
+
+  color_jitter_config:
+    brightness: 0.2
+    contrast: 0.2
+    saturation: 0.2
+    hue: 0.1
+  
 
 use_nested_tensors: false
 frame_transformer_dim: 1024

@@ -4,6 +4,8 @@ from enum import Enum
 
 import torch
 from torchvision.io import read_image, ImageReadMode
+from torchvision import tv_tensors
+from typing import Callable, Any
 from PIL import Image
 from tqdm import tqdm
 
@@ -24,12 +26,14 @@ class DukeMTMCVideoDataset(AbstractVideoReIDDataset):
         image_tensor_dtype: torch.dtype | None = None,
         load_segmentations: bool = False,
         verbose: bool = False,
+        transform: Callable | None = None,
     ):
         self.verbose = verbose
         self.load_image_pil = load_image_pil
         self.load_image_tensor = load_image_tensor
         self.load_segmentations = load_segmentations
         self.image_tensor_dtype = image_tensor_dtype
+        self.transform = transform
 
         if sidecar_root is not None:
             self.sidecar_root = Path(sidecar_root)
@@ -218,6 +222,19 @@ class DukeMTMCVideoDataset(AbstractVideoReIDDataset):
         image_tensor = self._load_frame_tensor(person_id, camera_id, frame_name) if self.load_image_tensor else None
         segmentation_path = self._get_segmentation_path(person_id, camera_id, frame_name) if self.sidecar_root else None
         segmentation_tensor = self._load_segmentation_tensor(person_id, camera_id, frame_name) if self.load_segmentations else None
+
+        if self.transform is not None:
+            if image_tensor is not None:
+                image_tensor = tv_tensors.Image(image_tensor)
+            if segmentation_tensor is not None:
+                segmentation_tensor = tv_tensors.Mask(segmentation_tensor)
+            
+            if image_tensor is not None and segmentation_tensor is not None:
+                image_tensor, segmentation_tensor = self.transform(image_tensor, segmentation_tensor)
+            elif image_tensor is not None:
+                image_tensor = self.transform(image_tensor)
+            elif segmentation_tensor is not None:
+                segmentation_tensor = self.transform(segmentation_tensor)
 
         return VideoReIDItem(
             sample_index=index,

@@ -11,6 +11,7 @@ uv run accelerate launch scripts/train_and_evaluate_multiple_parallel.py
 
 import os
 import sys
+import time
 import random
 import dataclasses
 from pathlib import Path
@@ -30,6 +31,40 @@ import hydra
 from hydra.core.config_store import ConfigStore
 from omegaconf import DictConfig, OmegaConf
 from pydantic import Field, BaseModel
+
+import torchvision.transforms.v2 as v2
+from torchvision.transforms.v2 import functional as tv_F
+
+class RandomRatioCrop(v2.Transform):
+    def __init__(self, ratio_range=(0.9, 1.0)):
+        super().__init__()
+        self.ratio_range = ratio_range
+
+    def forward(self, *inputs):
+        h, w = None, None
+        flat_inputs = inputs[0] if len(inputs) == 1 and isinstance(inputs[0], tuple) else inputs
+        for img in flat_inputs:
+            if hasattr(img, "shape") and len(img.shape) >= 2:
+                h, w = img.shape[-2], img.shape[-1]
+                break
+        
+        if h is None or w is None:
+            return inputs if len(inputs) > 1 else inputs[0]
+        
+        ratio = random.uniform(*self.ratio_range)
+        new_h, new_w = int(h * ratio), int(w * ratio)
+        
+        top = random.randint(0, h - new_h)
+        left = random.randint(0, w - new_w)
+        
+        outputs = []
+        for inpt in flat_inputs:
+            if hasattr(inpt, "shape") and len(inpt.shape) >= 2:
+                outputs.append(tv_F.crop(inpt, top, left, new_h, new_w))
+            else:
+                outputs.append(inpt)
+                
+        return tuple(outputs) if len(outputs) > 1 else outputs[0]
 
 from accelerate import Accelerator, DataLoaderConfiguration
 from accelerate.utils import gather_object
@@ -60,7 +95,40 @@ from open_vocab_mot.losses import CircleLossWithUnknowns
 from open_vocab_mot.eval import extract_embeddings, evaluate_reid, get_eval_identities_by_max_embeddings
 
 
-def compute_batch_loss(batch, dino_harness, model, criterion, device, frame_loss_weight, cross_loss_weight, dino_batch_split):
+class StepProfiler:
+    def __init__(self, device):
+        self.device = device
+        self.starts = {}
+        self.ends = {}
+    
+    def start(self, name):
+        if self.device.type == "cuda":
+            event = torch.cuda.Event(enable_timing=True)
+            event.record()
+            self.starts[name] = event
+        else:
+            self.starts[name] = time.perf_counter()
+            
+    def stop(self, name):
+        if self.device.type == "cuda":
+            event = torch.cuda.Event(enable_timing=True)
+            event.record()
+            self.ends[name] = event
+        else:
+            self.ends[name] = time.perf_counter()
+            
+    def elapsed(self, name):
+        if name not in self.starts or name not in self.ends:
+            return 0.0
+        if self.device.type == "cuda":
+            torch.cuda.synchronize() # Ensure events are recorded and executed
+            return self.starts[name].elapsed_time(self.ends[name]) / 1000.0
+        else:
+            return self.ends[name] - self.starts[name]
+
+def compute_batch_loss(batch, dino_harness, model, criterion, device, frame_loss_weight, cross_loss_weight, dino_batch_split, profiler=None):
+    if profiler is not None:
+        profiler.start("dino")
     # 1. Extract DINO embeddings (Gradients disabled for DINO)
     with torch.no_grad():
         valid_imgs = []
@@ -95,6 +163,10 @@ def compute_batch_loss(batch, dino_harness, model, criterion, device, frame_loss
             for valid_idx, emb in zip(valid_indices, valid_embs):
                 dino_embeddings[valid_idx] = emb
         
+    if profiler is not None:
+        profiler.stop("dino")
+        profiler.start("forward")
+        
     # 2. Group embeddings by video (person_id, camera_id) and track person_ids
     video_indices: dict[tuple[int, int], int] = {}
     video_embeddings: list[list[torch.Tensor]] = []
@@ -118,7 +190,9 @@ def compute_batch_loss(batch, dino_harness, model, criterion, device, frame_loss
         )
         
     if len(video_embeddings) < 2:
-        return None, None, None
+        if profiler is not None:
+            profiler.stop("forward")
+        return None, None, None, None
         
     # 3. Create Positive and Negative Masks
     video_pids = torch.tensor(video_person_ids, device=device)
@@ -170,8 +244,23 @@ def compute_batch_loss(batch, dino_harness, model, criterion, device, frame_loss
     video_weight = 1.0 - frame_loss_weight - cross_loss_weight
     total_loss = video_weight * video_loss + frame_loss_weight * frame_loss + cross_loss_weight * cross_loss
     
+    if profiler is not None:
+        profiler.stop("forward")
+        
     return video_loss, frame_loss, cross_loss, total_loss
 
+class ColorJitterConfig(BaseModel):
+    brightness: float = 0.2
+    contrast: float = 0.2
+    saturation: float = 0.2
+    hue: float = 0.1
+
+class AugmentationConfig(BaseModel):
+    enable: bool = True
+    crop_ratio_range: tuple[float, float] = (0.9, 1.0)
+    random_flip_prop: float = 0.5
+
+    color_jitter_config: ColorJitterConfig = Field(default_factory=ColorJitterConfig)
 
 class TrainConfig(BaseModel):
     epochs: int = 3
@@ -203,6 +292,8 @@ class TrainConfig(BaseModel):
     no_wandb: bool = False
     skip_eval: bool = False
     run_initial_mini_eval: bool = False
+
+    augmentation_config: AugmentationConfig = Field(default_factory=AugmentationConfig)
 
     use_nested_tensors: bool = True
     frame_transformer_dim: int = 512
@@ -521,6 +612,24 @@ def main(cfg: DictConfig):
         plot_file = Path(args.plot_path)
         plot_file.parent.mkdir(parents=True, exist_ok=True)
 
+    transform = None
+    # if args.enable_augmentations:
+    if args.augmentation_config.enable:
+        if accelerator.is_main_process:
+            print(f"Enabling training augmentations with config {args.augmentation_config}")
+        
+        crop_ratio_range = args.augmentation_config.crop_ratio_range
+        random_flip_prop = args.augmentation_config.random_flip_prop
+        color_jitter_config = args.augmentation_config.color_jitter_config
+        transform = v2.Compose([
+            RandomRatioCrop(ratio_range=crop_ratio_range),
+            v2.RandomHorizontalFlip(p=random_flip_prop),
+            v2.ColorJitter(brightness=color_jitter_config.brightness,
+                           contrast=color_jitter_config.contrast,
+                           saturation=color_jitter_config.saturation,
+                           hue=color_jitter_config.hue)
+        ])
+
     duke_iterable = None
     if args.duke.use_for_training:
         if accelerator.is_main_process:
@@ -529,7 +638,8 @@ def main(cfg: DictConfig):
             dataset_type="duke",
             config=args.duke,
             seed=args.seed + accelerator.process_index * 100,
-            verbose=accelerator.is_main_process
+            verbose=accelerator.is_main_process,
+            transform=transform
         )
 
     whale_iterable = None
@@ -540,7 +650,8 @@ def main(cfg: DictConfig):
             dataset_type="whale",
             config=args.whale,
             seed=args.seed + 1 + accelerator.process_index * 100,
-            verbose=accelerator.is_main_process
+            verbose=accelerator.is_main_process,
+            transform=transform
         )
 
     wildlife_iterables = {}
@@ -553,7 +664,8 @@ def main(cfg: DictConfig):
                 dataset_type="wildlife10k_subset",
                 config=subset_cfg,
                 seed=args.seed + 2 + len(wildlife_iterables) + accelerator.process_index * 100,
-                verbose=accelerator.is_main_process
+                verbose=accelerator.is_main_process,
+                transform=transform
             )
             wildlife_iterables[subset_name] = subset_iterable
             
@@ -565,7 +677,8 @@ def main(cfg: DictConfig):
             dataset_type="veri",
             config=args.veri,
             seed=args.seed + 3 + len(wildlife_iterables) + accelerator.process_index * 100,
-            verbose=accelerator.is_main_process
+            verbose=accelerator.is_main_process,
+            transform=transform
         )
         
     vrai_iterable = None
@@ -576,7 +689,8 @@ def main(cfg: DictConfig):
             dataset_type="vrai",
             config=args.vrai,
             seed=args.seed + 4 + len(wildlife_iterables) + accelerator.process_index * 100,
-            verbose=accelerator.is_main_process
+            verbose=accelerator.is_main_process,
+            transform=transform
         )
     
     if accelerator.is_main_process:
@@ -699,24 +813,39 @@ def main(cfg: DictConfig):
             print(f"\n--- Epoch {epoch+1}/{args.epochs} ---")
             
         progress = tqdm(total=args.batches_per_epoch, desc=f"Epoch {epoch+1}", disable=not accelerator.is_main_process)
+        profiler = StepProfiler(device)
         
+        batch_start_time = time.perf_counter()
         for batch_idx, (batch, selected_ds_name) in enumerate(combined_loader):
+            data_load_time = time.perf_counter() - batch_start_time
             if batch_idx >= args.batches_per_epoch:
                 break
                 
             # 1-5. Compute Losses via helper
             video_loss, frame_loss, cross_loss, total_loss = compute_batch_loss(
                 batch, dino_harness, model, criterion, device, 
-                args.frame_loss_weight, args.cross_loss_weight, args.dino_batch_split
+                args.frame_loss_weight, args.cross_loss_weight, args.dino_batch_split,
+                profiler=profiler
             )
             
             if total_loss is None:
+                batch_start_time = time.perf_counter()
                 continue
             
             # 6. Backward Pass and Optimize
+            profiler.start("backward")
             optimizer.zero_grad()
             accelerator.backward(total_loss)
             optimizer.step()
+            profiler.stop("backward")
+            
+            t_total_step = time.perf_counter() - batch_start_time
+            steps_per_sec = 1.0 / t_total_step if t_total_step > 0 else 0
+            
+            # Get timing metrics
+            t_dino = profiler.elapsed("dino")
+            t_forward = profiler.elapsed("forward")
+            t_backward = profiler.elapsed("backward")
             
             # Track history and log (only on main process)
             if accelerator.is_main_process:
@@ -735,19 +864,31 @@ def main(cfg: DictConfig):
                         f"train/{selected_ds_name}/loss": total_loss.item(),
                         "epoch": epoch + 1,
                         "batch": batch_idx,
+                        "profiling/data_load_time": data_load_time,
+                        "profiling/dino_time": t_dino,
+                        "profiling/forward_time": t_forward,
+                        "profiling/backward_time": t_backward,
+                        "profiling/total_step_time": t_total_step,
+                        "profiling/steps_per_sec": steps_per_sec,
                     })
                 
-                progress.set_postfix({"Loss": f"{total_loss.item():.4f}", "DS": selected_ds_name})
+                progress.set_postfix({
+                    "Loss": f"{total_loss.item():.4f}", 
+                    "DS": selected_ds_name,
+                    "s/it": f"{t_total_step:.2f}"
+                })
                 
                 if batch_idx % 10 == 0:
                     print(f"Batch {batch_idx} [{selected_ds_name}]: Total Loss = {total_loss.item():.4f} "
-                          f"(Video: {video_loss.item():.4f}, Frame: {frame_loss.item():.4f}, Cross: {cross_loss.item():.4f})")
+                          f"(Video: {video_loss.item():.4f}, Frame: {frame_loss.item():.4f}, Cross: {cross_loss.item():.4f}) | "
+                          f"Data: {data_load_time:.3f}s, DINO: {t_dino:.3f}s, Fwd: {t_forward:.3f}s, Bwd: {t_backward:.3f}s, Total: {t_total_step:.3f}s ({steps_per_sec:.2f} it/s)")
                 
                 # Update progress bar
                 progress.update(1)
             
             # Explicitly free memory at the end of the batch
             del batch
+            batch_start_time = time.perf_counter()
 
         run_mini_evaluation(epoch, args, model, dino_harness, criterion, device, accelerator, eval_datasets_cache)
         model.train()

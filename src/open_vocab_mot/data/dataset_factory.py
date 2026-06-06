@@ -61,7 +61,8 @@ def load_dataset_for_training(
     dataset_type: Literal["duke", "whale", "wildlife10k_subset", "veri", "vrai"],
     config: DatasetConfig,
     seed: int,
-    verbose: bool = False
+    verbose: bool = False,
+    transform: Any | None = None
 ) -> VideoReIDKPFBatchIterableDataset:
     
     kwargs = config.model_dump(exclude={"use_for_training", "weight", "frames_per_video", "people_per_batch", "views_per_person", "eval_tasks", "mini_eval_tasks", "subset_dataset", "min_num_images"}, exclude_unset=True, exclude_none=True)
@@ -75,6 +76,7 @@ def load_dataset_for_training(
             load_image_tensor=True,
             load_segmentations=True,
             verbose=verbose,
+            transform=transform,
             **kwargs
         )
     elif dataset_type == "whale":
@@ -88,6 +90,7 @@ def load_dataset_for_training(
             load_segmentations=True,
             min_num_images=getattr(config, "min_num_images", 0),
             verbose=verbose,
+            transform=transform,
             **kwargs
         )
     elif dataset_type == "wildlife10k_subset":
@@ -101,6 +104,7 @@ def load_dataset_for_training(
             load_segmentations=True,
             min_num_images=getattr(config, "min_num_images", 0),
             verbose=verbose,
+            transform=transform,
             **kwargs
         )
     elif dataset_type == "veri":
@@ -115,6 +119,7 @@ def load_dataset_for_training(
             load_segmentations=True,
             verbose=verbose,
             collapse_sequences=False,
+            transform=transform,
             **kwargs
         )
     elif dataset_type == "vrai":
@@ -126,6 +131,7 @@ def load_dataset_for_training(
             load_image_tensor=True,
             load_segmentations=True,
             verbose=verbose,
+            transform=transform,
             **kwargs
         )
     else:
