@@ -7,6 +7,7 @@ uv run scripts/unsupervised_ds_gen.py \
     --skip-frames 4 \
     --overlap 1 \
     --edge-width 15 \
+    --min-cc-ratio 0.05 \
     --verbose
 """
 
@@ -285,6 +286,7 @@ def main():
     parser.add_argument("--skip-frames", type=int, default=5, help="Number of frames to skip")
     parser.add_argument("--overlap", type=int, default=1, help="Overlap between batches")
     parser.add_argument("--edge-width", type=int, default=15, help="Edge width for cropped segmentations")
+    parser.add_argument("--min-cc-ratio", type=float, default=0.05, help="Minimum connected component area ratio to the largest component")
     parser.add_argument("--no-demo-videos", action="store_true", help="Disable demo video creation")
     parser.add_argument("--verbose", action="store_true", default=True, help="Verbose output")
     parser.add_argument("--device", type=str, default="cuda", help="Device to use for models (e.g. cuda, cuda:0)")
@@ -297,6 +299,7 @@ def main():
     edge_width = args.edge_width
     verbose = args.verbose
     device = args.device
+    min_cc_ratio = args.min_cc_ratio
 
     video_dirs = ingest_dataset_paths(UNSUPERVISED_DATASET_INPUT_PATH, ALLOWED_VIDEO_EXTENSIONS)
 
@@ -390,6 +393,27 @@ def main():
 
                 # We have a utility that gives us the unique ids with their corresponding maps
                 masks, obj_ids = int_mask_to_binary_masks(sam_seg, background_index=background_index)
+                
+                # Filter out small connected components
+                new_masks = []
+                for mask in masks:
+                    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask.astype(np.uint8), connectivity=8)
+                    if num_labels > 1:
+                        areas = stats[1:, cv2.CC_STAT_AREA]
+                        max_area = np.max(areas)
+                        valid_labels = np.where(areas >= max_area * min_cc_ratio)[0] + 1
+                        
+                        filtered_mask = np.isin(labels, valid_labels)
+                        
+                        # Remove filtered pixels from sam_seg
+                        removed_pixels = mask & ~filtered_mask
+                        sam_seg[removed_pixels] = background_index
+                        
+                        new_masks.append(filtered_mask)
+                    else:
+                        new_masks.append(mask)
+                masks = new_masks
+
                 obj_prompts = [obj_id_to_prompt.get(obj_id, "UNKNOWN") for obj_id in obj_ids]
                 
                 # We can use the unique ids to populate the visible seg map for this frame
