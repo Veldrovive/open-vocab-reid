@@ -8,6 +8,6 @@ from .vrai_ds import VRAIDataset
 from .veri_video_ds import VeRiVideoDataset
 from .sam_utils import process_sam_masks_for_dataset, custom_collate
 from .dataset_factory import (
-    DatasetConfig, DukeDatasetConfig, WhaleDatasetConfig, Wildlife10kSubsetDatasetConfig,
-    VeRiDatasetConfig, VRAIDatasetConfig, load_dataset_for_training, load_dataset_for_eval
+    DatasetConfig, DukeDatasetConfig, WhaleDatasetConfig, Wildlife10kSubsetDatasetConfig, HypersimDatasetConfig,
+    VeRiDatasetConfig, VRAIDatasetConfig, UnsupervisedDatasetConfig, load_dataset_for_training, load_dataset_for_eval
 )

@@ -7,7 +7,9 @@ from open_vocab_mot.data.duke_mtmc_video_ds import DukeMTMCVideoDataset
 from open_vocab_mot.data.wildlife_10k_subset_ds import Wildlife10KSubsetDataset, Wildlife10KDatasets
 from open_vocab_mot.data.veri_video_ds import VeRiVideoDataset
 from open_vocab_mot.data.vrai_ds import VRAIDataset
+from open_vocab_mot.data.hypersim_ds import HypersimVideoReIDDataset, HypersimBatchIterableDataset
 from open_vocab_mot.data.video_reid_abc import VideoReIDKPFBatchIterableDataset, AbstractVideoReIDDataset, DatasetSplit
+from open_vocab_mot.data.unsupervised_video_reid import UnsupervisedVideoReIDDataset, UnsupervisedBatchIterableDataset
 
 from open_vocab_mot.definitions import (
     DUKEMTMC_VIDEO_REID_PATH, 
@@ -19,7 +21,10 @@ from open_vocab_mot.definitions import (
     VERI_DATASET_PATH,
     VERI_DATASET_SIDECAR_PATH,
     VRAI_DATASET_PATH,
-    VRAI_DATASET_SIDECAR_PATH
+    VRAI_DATASET_SIDECAR_PATH,
+    HYPERSIM_DATASET_PATH,
+    HYPERSIM_DATASET_SIDECAR_PATH,
+    UNSUPERVISED_DATASET_OUTPUT_PATH
 )
 
 
@@ -56,16 +61,26 @@ class VeRiDatasetConfig(DatasetConfig):
 class VRAIDatasetConfig(DatasetConfig):
     pass
 
+class HypersimDatasetConfig(DatasetConfig):
+    num_hard_negatives_per_positive: int = 1
+    val_split_ratio: float = 0.1
+    split_seed: int = 42
+
+class UnsupervisedDatasetConfig(DatasetConfig):
+    subset_dataset: str
+    warn_skipped_identities: bool = True
+    num_hard_negatives_per_positive: int = 1
+
 
 def load_dataset_for_training(
-    dataset_type: Literal["duke", "whale", "wildlife10k_subset", "veri", "vrai"],
+    dataset_type: Literal["duke", "whale", "wildlife10k_subset", "veri", "vrai", "unsupervised", "hypersim"],
     config: DatasetConfig,
     seed: int,
     verbose: bool = False,
     transform: Any | None = None
-) -> VideoReIDKPFBatchIterableDataset:
+) -> VideoReIDKPFBatchIterableDataset | UnsupervisedBatchIterableDataset | HypersimBatchIterableDataset:
     
-    kwargs = config.model_dump(exclude={"use_for_training", "weight", "frames_per_video", "people_per_batch", "views_per_person", "eval_tasks", "mini_eval_tasks", "subset_dataset", "min_num_images"}, exclude_unset=True, exclude_none=True)
+    kwargs = config.model_dump(exclude={"use_for_training", "weight", "frames_per_video", "people_per_batch", "views_per_person", "eval_tasks", "mini_eval_tasks", "subset_dataset", "min_num_images", "warn_skipped_identities", "num_hard_negatives_per_positive", "val_split_ratio", "split_seed"}, exclude_unset=True, exclude_none=True)
     
     if dataset_type == "duke":
         ds = DukeMTMCVideoDataset(
@@ -134,6 +149,53 @@ def load_dataset_for_training(
             transform=transform,
             **kwargs
         )
+    elif dataset_type == "unsupervised":
+        ds = UnsupervisedVideoReIDDataset(
+            ds_root=UNSUPERVISED_DATASET_OUTPUT_PATH / getattr(config, "subset_dataset"),
+            num_sequences_per_tracklet=config.views_per_person,
+            num_frames_per_sequence=config.frames_per_video,
+            warn_skipped_identities=getattr(config, "warn_skipped_identities", True),
+            load_image_pil=False,
+            load_image_tensor=True,
+            load_segmentations=True,
+            transform=transform,
+            **kwargs
+        )
+        return UnsupervisedBatchIterableDataset(
+            dataset=ds,
+            batches_per_epoch=None,
+            num_identities_per_batch=config.people_per_batch,
+            num_hard_negatives_per_positive=getattr(config, "num_hard_negatives_per_positive", 1),
+            num_sequences_per_tracklet=config.views_per_person,
+            num_frames_per_sequence=config.frames_per_video,
+            epoch_deterministic=False,
+            seed=seed,
+            verbose=verbose
+        )
+    elif dataset_type == "hypersim":
+        ds = HypersimVideoReIDDataset(
+            ds_root=HYPERSIM_DATASET_PATH,
+            sidecar_path=HYPERSIM_DATASET_SIDECAR_PATH,
+            split=DatasetSplit.TRAIN,
+            val_split_ratio=getattr(config, "val_split_ratio", 0.1),
+            split_seed=getattr(config, "split_seed", 42),
+            load_image_pil=False,
+            load_image_tensor=True,
+            load_segmentations=True,
+            transform=transform,
+            **kwargs
+        )
+        return HypersimBatchIterableDataset(
+            dataset=ds,
+            batches_per_epoch=None,
+            num_identities_per_batch=config.people_per_batch,
+            num_hard_negatives_per_positive=getattr(config, "num_hard_negatives_per_positive", 1),
+            num_sequences_per_tracklet=config.views_per_person,
+            num_frames_per_sequence=config.frames_per_video,
+            epoch_deterministic=False,
+            seed=seed,
+            verbose=verbose
+        )
     else:
         raise ValueError(f"Unknown dataset type {dataset_type}")
 
@@ -152,11 +214,11 @@ def load_dataset_for_training(
     )
 
 def load_dataset_for_eval(
-    dataset_type: Literal["duke", "whale", "wildlife10k_subset", "veri", "vrai"],
+    dataset_type: Literal["duke", "whale", "wildlife10k_subset", "veri", "vrai", "hypersim"],
     config: DatasetConfig,
     verbose: bool = False
 ) -> Dict[str, AbstractVideoReIDDataset]:
-    kwargs = config.model_dump(exclude={"use_for_training", "weight", "frames_per_video", "people_per_batch", "views_per_person", "eval_tasks", "mini_eval_tasks", "subset_dataset", "min_num_images"}, exclude_unset=True, exclude_none=True)
+    kwargs = config.model_dump(exclude={"use_for_training", "weight", "frames_per_video", "people_per_batch", "views_per_person", "eval_tasks", "mini_eval_tasks", "subset_dataset", "min_num_images", "val_split_ratio", "split_seed"}, exclude_unset=True, exclude_none=True)
     
     if dataset_type == "duke":
         query_ds = DukeMTMCVideoDataset(
@@ -257,6 +319,31 @@ def load_dataset_for_eval(
             load_image_tensor=True,
             load_segmentations=True,
             verbose=verbose,
+            **kwargs
+        )
+        return {"query": query_ds, "gallery": gallery_ds}
+        
+    elif dataset_type == "hypersim":
+        query_ds = HypersimVideoReIDDataset(
+            ds_root=HYPERSIM_DATASET_PATH,
+            sidecar_path=HYPERSIM_DATASET_SIDECAR_PATH,
+            split=DatasetSplit.QUERY,
+            val_split_ratio=getattr(config, "val_split_ratio", 0.1),
+            split_seed=getattr(config, "split_seed", 42),
+            load_image_pil=False,
+            load_image_tensor=True,
+            load_segmentations=True,
+            **kwargs
+        )
+        gallery_ds = HypersimVideoReIDDataset(
+            ds_root=HYPERSIM_DATASET_PATH,
+            sidecar_path=HYPERSIM_DATASET_SIDECAR_PATH,
+            split=DatasetSplit.GALLERY,
+            val_split_ratio=getattr(config, "val_split_ratio", 0.1),
+            split_seed=getattr(config, "split_seed", 42),
+            load_image_pil=False,
+            load_image_tensor=True,
+            load_segmentations=True,
             **kwargs
         )
         return {"query": query_ds, "gallery": gallery_ds}

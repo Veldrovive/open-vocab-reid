@@ -1,11 +1,23 @@
 #!/usr/bin/env python3
 
 """
-uv run scripts/unsupervised_ds_gen.py \
+uvx yt-dlp -f "bestvideo[vcodec^=avc]+bestaudio[ext=m4a]/best[ext=mp4]/best" --merge-output-format mp4 \
+    -o [NAME].mp4 \
+    https://www.youtube.com/watch?v=[VIDEO_ID]
+
+uv run scripts/unsupervised_ds_gen_parallel.py \
     --device cuda \
-    --batch-size 120 \
+    --batch-size 30 \
     --skip-frames 4 \
-    --overlap 1 \
+    --overlap 5 \
+    --edge-width 15 \
+    --min-cc-ratio 0.05 \
+    --verbose
+
+uv run accelerate launch scripts/ds_gen_accelerate.py \
+    --batch-size 30 \
+    --skip-frames 4 \
+    --overlap 5 \
     --edge-width 15 \
     --min-cc-ratio 0.05 \
     --verbose
@@ -24,6 +36,10 @@ from typing import Iterator, List, Any
 from tqdm import tqdm
 from shutil import rmtree
 import imageio
+import threading
+import queue
+import traceback
+from accelerate import Accelerator
 
 from open_vocab_mot import UNSUPERVISED_DATASET_INPUT_PATH, UNSUPERVISED_DATASET_OUTPUT_PATH
 
@@ -284,7 +300,176 @@ def ingest_dataset_paths(ds_root: Path, allowed_video_extensions: list[str]) -> 
     return VideoDirs(dirs_data=video_dirs)
 
 
+def io_processing_worker(work_queue, video_info, skip_frames, min_cc_ratio, edge_width,
+                         needs_demo_video, tmp_demo_video_path,
+                         has_full_segmentations, tmp_full_segmentations_dir,
+                         has_cropped_segmentations, tmp_cropped_segmentations_dir):
+    
+    visible_seg_map: dict[int, list[int]] = {}  
+    known_negatives: set[tuple[int, int]] = set()
+    global_id_to_prompt: dict[int, str] = {}
+    global_id_to_color: dict[int, tuple] = {}
+
+    if needs_demo_video:
+        demo_video_frame_rate = video_info.fps / skip_frames if skip_frames is not None else video_info.fps
+        demo_video_writer = imageio.get_writer(tmp_demo_video_path, fps=demo_video_frame_rate, format="mp4", codec="libx264")
+    else:
+        demo_video_writer = None
+
+    try:
+        while True:
+            item = work_queue.get()
+            if item is None:  # Sentinel value indicating we are done
+                break
+                
+            frame_num, frame, segmentations, background_index = item
+
+            all_masks = []
+            all_obj_ids = []
+            all_obj_prompts = []
+
+            for prompt, sam_seg in segmentations.items():
+                masks, obj_ids = int_mask_to_binary_masks(sam_seg, background_index=background_index)
+                
+                # Filter out small connected components
+                new_masks = []
+                for mask in masks:
+                    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask.astype(np.uint8), connectivity=8)
+                    if num_labels > 1:
+                        areas = stats[1:, cv2.CC_STAT_AREA]
+                        max_area = np.max(areas)
+                        valid_labels = np.where(areas >= max_area * min_cc_ratio)[0] + 1
+                        
+                        filtered_mask = np.isin(labels, valid_labels)
+                        
+                        # Remove filtered pixels from sam_seg
+                        removed_pixels = mask & ~filtered_mask
+                        sam_seg[removed_pixels] = background_index
+                        
+                        new_masks.append(filtered_mask)
+                    else:
+                        new_masks.append(mask)
+                
+                all_masks.extend(new_masks)
+                all_obj_ids.extend(obj_ids)
+                all_obj_prompts.extend([prompt] * len(obj_ids))
+            
+            masks = all_masks
+            obj_ids = all_obj_ids
+            obj_prompts = all_obj_prompts
+
+            # Assign consistent colors to new obj_ids
+            for obj_id in obj_ids:
+                if obj_id not in global_id_to_color:
+                    global_id_to_color[obj_id] = get_colors(len(global_id_to_color) + 1)[-1]
+            
+            # We can use the unique ids to populate the visible seg map for this frame
+            visible_seg_map[frame_num] = obj_ids
+
+            # Update the global map from id to prompt
+            for obj_id, prompt in zip(obj_ids, obj_prompts):
+                global_id_to_prompt[obj_id] = prompt
+
+            # Known negatives constraint: appear at the same time and at least one point have no overlap
+            for i in range(len(obj_ids)):
+                for j in range(i+1, len(obj_ids)):
+                    lower = min(obj_ids[i], obj_ids[j])
+                    higher = max(obj_ids[i], obj_ids[j])
+                    if (lower, higher) not in known_negatives:
+                        if not np.any(masks[i] & masks[j]):
+                            known_negatives.add((lower, higher))
+
+            if needs_demo_video:
+                labels = [f"{obj_prompt} {obj_id}" for obj_prompt, obj_id in zip(obj_prompts, obj_ids)]
+                frame_colors = [global_id_to_color[obj_id] for obj_id in obj_ids]
+                segmented_frame = visualize_segmentations(frame, masks, colors=frame_colors, labels=labels)
+                segmented_frame_array = np.expand_dims(np.array(segmented_frame), axis=0)
+                demo_video_writer.append_data(segmented_frame_array)
+
+            if not has_full_segmentations:
+                frame_path = tmp_full_segmentations_dir / f"frame_{frame_num}.jpg"
+                frame.save(frame_path)
+
+                for prompt, sam_seg in segmentations.items():
+                    safe_prompt = prompt.replace(" ", "_").replace("/", "_")
+                    segmentation_path = tmp_full_segmentations_dir / f"frame_{frame_num}_{safe_prompt}_seg.png"
+                    seg_img = Image.fromarray(sam_seg)
+                    seg_img.save(segmentation_path)
+
+            if not has_cropped_segmentations:
+                frame_w, frame_h = frame.size
+
+                for mask, obj_id in zip(masks, obj_ids):
+                    rows = np.any(mask, axis=1)
+                    cols = np.any(mask, axis=0)
+                    
+                    if not np.any(rows) or not np.any(cols):
+                        continue
+                        
+                    rmin, rmax = np.where(rows)[0][[0, -1]]
+                    cmin, cmax = np.where(cols)[0][[0, -1]]
+                    
+                    rmin = max(0, rmin - edge_width)
+                    rmax = min(frame_h, rmax + edge_width + 1)
+                    cmin = max(0, cmin - edge_width)
+                    cmax = min(frame_w, cmax + edge_width + 1)
+                    
+                    cropped_frame = frame.crop((cmin, rmin, cmax, rmax))
+                    
+                    cropped_mask_array = mask[rmin:rmax, cmin:cmax]
+                    cropped_mask_img = Image.fromarray((cropped_mask_array * 255).astype(np.uint8))
+                    
+                    obj_dir = tmp_cropped_segmentations_dir / f"id_{obj_id}"
+                    obj_dir.mkdir(parents=True, exist_ok=True)
+                    
+                    cropped_frame.save(obj_dir / f"frame_{frame_num}.jpg")
+                    cropped_mask_img.save(obj_dir / f"frame_{frame_num}_mask.png")
+
+            work_queue.task_done()
+
+        # --- GENERATE METADATA ---
+        negatives_map: dict[int, list[int]] = {obj_id: [] for obj_id in global_id_to_prompt.keys()}
+        for id1, id2 in known_negatives:
+            negatives_map[id1].append(id2)
+            negatives_map[id2].append(id1)
+            
+        if not has_cropped_segmentations:
+            for obj_id, prompt in global_id_to_prompt.items():
+                obj_dir = tmp_cropped_segmentations_dir / f"id_{obj_id}"
+                if obj_dir.exists():
+                    meta = {
+                        "prompt": prompt,
+                        "negatives": negatives_map.get(obj_id, [])
+                    }
+                    with open(obj_dir / "metadata.yaml", "w") as f:
+                        yaml.dump(meta, f, default_flow_style=False)
+
+        if not has_full_segmentations:
+            full_meta = {
+                "visible_seg_map": visible_seg_map,
+                "known_negatives": [list(pair) for pair in known_negatives], 
+                "id_to_prompt": global_id_to_prompt
+            }
+            with open(tmp_full_segmentations_dir / "metadata.yaml", "w") as f:
+                yaml.dump(full_meta, f, default_flow_style=False)
+
+    finally:
+        if demo_video_writer is not None:
+            demo_video_writer.close()
+
+
 def main():
+    accelerator = Accelerator()
+
+    # Hide distributed environment variables from SAM3 so it processes videos independently 
+    # per GPU instead of trying to distribute a single video's frames across all GPUs.
+    if "WORLD_SIZE" in os.environ:
+        del os.environ["WORLD_SIZE"]
+    if "RANK" in os.environ:
+        del os.environ["RANK"]
+    if "LOCAL_RANK" in os.environ:
+        del os.environ["LOCAL_RANK"]
+
     parser = argparse.ArgumentParser(description="Unsupervised dataset generation")
     parser.add_argument("--batch-size", type=int, default=120, help="Batch size for SAM3")
     parser.add_argument("--skip-frames", type=int, default=5, help="Number of frames to skip")
@@ -293,7 +478,7 @@ def main():
     parser.add_argument("--min-cc-ratio", type=float, default=0.05, help="Minimum connected component area ratio to the largest component")
     parser.add_argument("--no-demo-videos", action="store_true", help="Disable demo video creation")
     parser.add_argument("--verbose", action="store_true", default=True, help="Verbose output")
-    parser.add_argument("--device", type=str, default="cuda", help="Device to use for models (e.g. cuda, cuda:0)")
+    parser.add_argument("--device", type=str, default=None, help="Device to use for models (e.g. cuda, cuda:0)")
     parser.add_argument("--num-prompt-applications", type=int, default=1, help="Number of prompt applications")
     parser.add_argument("--prompt-frame-spacing", type=str, default="space_between", choices=["space_around", "space_between"], help="Prompt frame spacing strategy")
     parser.add_argument("--iou-thresh", type=float, default=0.9, help="IOU threshold for segmentation")
@@ -305,17 +490,27 @@ def main():
     create_demo_videos = not args.no_demo_videos
     edge_width = args.edge_width
     verbose = args.verbose
-    device = args.device
+    device = args.device if args.device is not None else str(accelerator.device)
     min_cc_ratio = args.min_cc_ratio
     num_prompt_applications = args.num_prompt_applications
     prompt_frame_spacing = args.prompt_frame_spacing
     iou_thresh = args.iou_thresh
 
     video_dirs = ingest_dataset_paths(UNSUPERVISED_DATASET_INPUT_PATH, ALLOWED_VIDEO_EXTENSIONS)
-    print(f"Found {len(video_dirs.dirs_data)} video directories:\n{video_dirs.dirs_data}")
+    
+    if accelerator.is_main_process:
+        print(f"Found {len(video_dirs.dirs_data)} video directories:\n{video_dirs.dirs_data}")
+        for dir_data, video_data in video_dirs.iter_videos():
+            video_path = video_data.path
+            video_parent_relpath = str(video_path.parent.relative_to(UNSUPERVISED_DATASET_INPUT_PATH))
+            base_out_dir = UNSUPERVISED_DATASET_OUTPUT_PATH / video_parent_relpath / video_path.stem
+            base_out_dir.mkdir(exist_ok=True, parents=True)
+            
+    accelerator.wait_for_everyone()
 
     if len(video_dirs.dirs_data) == 0:
-        print("No videos found to process.")
+        if accelerator.is_main_process:
+            print("No videos found to process.")
         return
 
     sam = SAM3Harness(max_num_objects=64, device=device)
@@ -325,7 +520,6 @@ def main():
         video_path = video_data.path
         video_parent_relpath = str(video_path.parent.relative_to(UNSUPERVISED_DATASET_INPUT_PATH))
         base_out_dir = UNSUPERVISED_DATASET_OUTPUT_PATH / video_parent_relpath / video_path.stem
-        base_out_dir.mkdir(exist_ok=True, parents=True)
 
         video_info = get_video_data(video_path)
 
@@ -335,38 +529,46 @@ def main():
             video_data.config.removed_prompts if video_data.config else []
         )
 
-        # We keep intermediate results in temp files so that we can tell if it actually finished
         demo_video_path = base_out_dir / f"{video_path.stem}_segs.mp4"
         tmp_demo_video_path = base_out_dir / f"{video_path.stem}_segs_tmp.mp4"
         has_demo_video = demo_video_path.exists()
         needs_demo_video = not has_demo_video and create_demo_videos
-        if tmp_demo_video_path.exists():
-            print(f"Removing old temp demo video")
-            tmp_demo_video_path.unlink(missing_ok=True)
 
         full_segmentations_dir = base_out_dir / "full_frame_segmentations"
         tmp_full_segmentations_dir = base_out_dir / "full_frame_segmentations_tmp"
         has_full_segmentations = full_segmentations_dir.exists()
+
+        cropped_segmentations_dir = base_out_dir / "cropped_segmentations"
+        tmp_cropped_segmentations_dir = base_out_dir / "cropped_segmentations_tmp"
+        has_cropped_segmentations = cropped_segmentations_dir.exists()
+
+        needs_processing = not (has_demo_video and has_full_segmentations and has_cropped_segmentations)
+
+        if not needs_processing:
+            continue
+
+        lock_file = base_out_dir / ".processing.lock"
+        try:
+            fd = os.open(lock_file, os.O_CREAT | os.O_EXCL | os.O_RDWR)
+            os.close(fd)
+        except FileExistsError:
+            continue
+
+        print(f"[Process {accelerator.process_index}] Processing video {video_path} to {base_out_dir} with prompts {prompts}")
+
+        if tmp_demo_video_path.exists():
+            print(f"Removing old temp demo video")
+            tmp_demo_video_path.unlink(missing_ok=True)
+
         if tmp_full_segmentations_dir.exists():
             print(f"Removing old temp full frame segmentations dir")
             rmtree(tmp_full_segmentations_dir, ignore_errors=True)
         tmp_full_segmentations_dir.mkdir(exist_ok=True)
 
-        cropped_segmentations_dir = base_out_dir / "cropped_segmentations"
-        tmp_cropped_segmentations_dir = base_out_dir / "cropped_segmentations_tmp"
-        has_cropped_segmentations = cropped_segmentations_dir.exists()
         if tmp_cropped_segmentations_dir.exists():
             print(f"Removing old temp cropped segmentations dir")
             rmtree(tmp_cropped_segmentations_dir, ignore_errors=True)
         tmp_cropped_segmentations_dir.mkdir(exist_ok=True)
-
-        needs_processing = not (has_demo_video and has_full_segmentations and has_cropped_segmentations)
-
-        if not needs_processing:
-            print(f"Video {video_path} already has results in {base_out_dir}")
-            continue
-
-        print(f"Processing video {video_path} to {base_out_dir} with prompts {prompts}")
 
         constrained_scenes = get_constrained_scenes(video_path, transnet, threshold=0.75)
 
@@ -390,151 +592,41 @@ def main():
 
         try:
             frames_to_process = video_info.frame_count // skip_frames if skip_frames else video_info.frame_count
-            progress = tqdm(total=frames_to_process, disable=not verbose)
-            if needs_demo_video:
-                demo_video_frame_rate = video_info.fps / skip_frames if skip_frames is not None else video_info.fps
-                demo_video_writer = imageio.get_writer(tmp_demo_video_path, fps=demo_video_frame_rate, format="mp4", codec="libx264")
-            else:
-                demo_video_writer = None
+            progress = tqdm(total=frames_to_process, disable=not verbose, position=accelerator.process_index)
+            
+            # Setup a queue with a strict limit to prevent RAM bloat
+            work_queue = queue.Queue(maxsize=50) 
+            
+            # Start the I/O processing worker in a background thread
+            io_thread = threading.Thread(
+                target=io_processing_worker,
+                args=(
+                    work_queue, video_info, skip_frames, min_cc_ratio, edge_width,
+                    needs_demo_video, tmp_demo_video_path,
+                    has_full_segmentations, tmp_full_segmentations_dir,
+                    has_cropped_segmentations, tmp_cropped_segmentations_dir
+                )
+            )
+            io_thread.start()
 
-            visible_seg_map: dict[int, list[int]] = {}  # Which tracklets are visible on each frame
-            known_negatives: set[tuple[int, int]] = set()
-            global_id_to_prompt: dict[int, str] = {}
-            global_id_to_color: dict[int, tuple] = {}
+            # The Main Thread only cares about pushing GPU inference to the queue
             for frame_info in frame_seg_generator:
                 frame_num, frame, segmentations, background_index = frame_info
                 progress.update(1)
                 progress.set_description(f"Frame {frame_num}/{video_info.frame_count}")
-
-                all_masks = []
-                all_obj_ids = []
-                all_obj_prompts = []
-
-                for prompt, sam_seg in segmentations.items():
-                    masks, obj_ids = int_mask_to_binary_masks(sam_seg, background_index=background_index)
-                    
-                    # Filter out small connected components
-                    new_masks = []
-                    for mask in masks:
-                        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask.astype(np.uint8), connectivity=8)
-                        if num_labels > 1:
-                            areas = stats[1:, cv2.CC_STAT_AREA]
-                            max_area = np.max(areas)
-                            valid_labels = np.where(areas >= max_area * min_cc_ratio)[0] + 1
-                            
-                            filtered_mask = np.isin(labels, valid_labels)
-                            
-                            # Remove filtered pixels from sam_seg
-                            removed_pixels = mask & ~filtered_mask
-                            sam_seg[removed_pixels] = background_index
-                            
-                            new_masks.append(filtered_mask)
-                        else:
-                            new_masks.append(mask)
-                    
-                    all_masks.extend(new_masks)
-                    all_obj_ids.extend(obj_ids)
-                    all_obj_prompts.extend([prompt] * len(obj_ids))
                 
-                masks = all_masks
-                obj_ids = all_obj_ids
-                obj_prompts = all_obj_prompts
+                # Push the data to the queue. 
+                # This will block if the queue hits maxsize (50), keeping RAM in check.
+                work_queue.put((frame_num, frame, segmentations, background_index))
 
-                # Assign consistent colors to new obj_ids
-                for obj_id in obj_ids:
-                    if obj_id not in global_id_to_color:
-                        global_id_to_color[obj_id] = get_colors(len(global_id_to_color) + 1)[-1]
-                
-                # We can use the unique ids to populate the visible seg map for this frame
-                visible_seg_map[frame_num] = obj_ids
-
-                # Update the global map from id to prompt
-                for obj_id, prompt in zip(obj_ids, obj_prompts):
-                    global_id_to_prompt[obj_id] = prompt
-
-                # Known negatives constraint: appear at the same time and at least one point have no overlap
-                for i in range(len(obj_ids)):
-                    for j in range(i+1, len(obj_ids)):
-                        lower = min(obj_ids[i], obj_ids[j])
-                        higher = max(obj_ids[i], obj_ids[j])
-                        if (lower, higher) not in known_negatives:
-                            if not np.any(masks[i] & masks[j]):
-                                known_negatives.add((lower, higher))
-
-                if needs_demo_video:
-                    labels = [f"{obj_prompt} {obj_id}" for obj_prompt, obj_id in zip(obj_prompts, obj_ids)]
-                    frame_colors = [global_id_to_color[obj_id] for obj_id in obj_ids]
-                    segmented_frame = visualize_segmentations(frame, masks, colors=frame_colors, labels=labels)
-                    segmented_frame_array = np.expand_dims(np.array(segmented_frame), axis=0)
-                    demo_video_writer.append_data(segmented_frame_array)
-
-                if not has_full_segmentations:
-                    frame_path = tmp_full_segmentations_dir / f"frame_{frame_num}.jpg"
-                    frame.save(frame_path)
-
-                    for prompt, sam_seg in segmentations.items():
-                        safe_prompt = prompt.replace(" ", "_").replace("/", "_")
-                        segmentation_path = tmp_full_segmentations_dir / f"frame_{frame_num}_{safe_prompt}_seg.png"
-                        seg_img = Image.fromarray(sam_seg)
-                        seg_img.save(segmentation_path)
-
-                if not has_cropped_segmentations:
-                    frame_w, frame_h = frame.size
-
-                    for mask, obj_id in zip(masks, obj_ids):
-                        rows = np.any(mask, axis=1)
-                        cols = np.any(mask, axis=0)
-                        
-                        if not np.any(rows) or not np.any(cols):
-                            continue
-                            
-                        rmin, rmax = np.where(rows)[0][[0, -1]]
-                        cmin, cmax = np.where(cols)[0][[0, -1]]
-                        
-                        rmin = max(0, rmin - edge_width)
-                        rmax = min(frame_h, rmax + edge_width + 1)
-                        cmin = max(0, cmin - edge_width)
-                        cmax = min(frame_w, cmax + edge_width + 1)
-                        
-                        cropped_frame = frame.crop((cmin, rmin, cmax, rmax))
-                        
-                        cropped_mask_array = mask[rmin:rmax, cmin:cmax]
-                        cropped_mask_img = Image.fromarray((cropped_mask_array * 255).astype(np.uint8))
-                        
-                        obj_dir = tmp_cropped_segmentations_dir / f"id_{obj_id}"
-                        obj_dir.mkdir(parents=True, exist_ok=True)
-                        
-                        cropped_frame.save(obj_dir / f"frame_{frame_num}.jpg")
-                        cropped_mask_img.save(obj_dir / f"frame_{frame_num}_mask.png")
-
+            # Send the shutdown signal to the worker
+            work_queue.put(None)
             
-            # --- GENERATE METADATA ---
-            negatives_map: dict[int, list[int]] = {obj_id: [] for obj_id in global_id_to_prompt.keys()}
-            for id1, id2 in known_negatives:
-                negatives_map[id1].append(id2)
-                negatives_map[id2].append(id1)
-                
-            if not has_cropped_segmentations:
-                for obj_id, prompt in global_id_to_prompt.items():
-                    obj_dir = tmp_cropped_segmentations_dir / f"id_{obj_id}"
-                    if obj_dir.exists():
-                        meta = {
-                            "prompt": prompt,
-                            "negatives": negatives_map.get(obj_id, [])
-                        }
-                        with open(obj_dir / "metadata.yaml", "w") as f:
-                            yaml.dump(meta, f, default_flow_style=False)
+            # Wait for all I/O processing and metadata generation to finish
+            io_thread.join()
 
-            if not has_full_segmentations:
-                full_meta = {
-                    "visible_seg_map": visible_seg_map,
-                    "known_negatives": [list(pair) for pair in known_negatives], 
-                    "id_to_prompt": global_id_to_prompt
-                }
-                with open(tmp_full_segmentations_dir / "metadata.yaml", "w") as f:
-                    yaml.dump(full_meta, f, default_flow_style=False)
-
-            if demo_video_writer is not None:
+            # Now that the thread is fully done and closed all files, rename them
+            if needs_demo_video: 
                 tmp_demo_video_path.rename(demo_video_path)
 
             if not has_full_segmentations:
@@ -543,11 +635,33 @@ def main():
             if not has_cropped_segmentations:
                 tmp_cropped_segmentations_dir.rename(cropped_segmentations_dir)
 
-            print(f"Finished processing video {video_path} to {base_out_dir}")
-        finally:
-            if demo_video_writer is not None:
-                demo_video_writer.close()
-                del demo_video_writer
+            lock_file.unlink(missing_ok=True)
+            print(f"[Process {accelerator.process_index}] Finished processing video {video_path} to {base_out_dir}")
+
+        except Exception as e:
+            print(f"Error processing video {video_path}: {e}")
+            traceback.print_exc()
+            # Ensure we don't leave a hanging thread if an exception occurs in the main thread
+            if 'work_queue' in locals():
+                work_queue.put(None)
+                io_thread.join()
+            lock_file.unlink(missing_ok=True)
+
+    # Release GPU memory proactively when the process finishes all available videos
+    print(f"[Process {accelerator.process_index}] Finished all available videos. Releasing GPU memory and exiting.")
+    del sam
+    del transnet
+    import gc
+    import torch
+    gc.collect()
+    torch.cuda.empty_cache()
+    
+    # # Force exit to ensure process terminates and frees any remaining resources
+    # import sys
+    # sys.exit(0)
+
+    # Instead, we wait till everything gets here. Since we already relesased resources it's fine
+    accelerator.wait_for_everyone()
 
 if __name__ == "__main__":
     main()

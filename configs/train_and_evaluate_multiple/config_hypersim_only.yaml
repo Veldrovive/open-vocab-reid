@@ -23,10 +23,10 @@ mini_eval_max_frame_embeddings: 1
 eval_batch_size: 16
 
 wandb_project: "open-vocab-mot-tests"
-wandb_name: "higher-contrast-dim"
+wandb_name: "low-dino-dim"
 wandb_entity: null
 no_wandb: false
-run_initial_mini_eval: true
+run_initial_mini_eval: false
 
 augmentation_config:
   enable: false
@@ -62,30 +62,18 @@ dropout: 0.01
 # dropout: 0.1
 
 duke:
-  eval_tasks:
-    - query_source: 'query'
-      query_modality: 'video'
-      gallery_source: 'gallery'
-      gallery_modality: 'video'
-  mini_eval_tasks:
-    - query_source: 'query'
-      query_modality: 'video'
-      gallery_source: 'gallery'
-      gallery_modality: 'video'
-  use_for_training: true
+  eval_tasks: []
+  mini_eval_tasks: []
+  use_for_training: false
   weight: 1.0
   frames_per_video: 8
   people_per_batch: 16
   views_per_person: 4
 
 whale:
-  eval_tasks:
-    - query_source: 'val'
-      query_modality: 'frame'
-      gallery_source: 'val'
-      gallery_modality: 'frame'
+  eval_tasks: []
   mini_eval_tasks: []
-  use_for_training: true
+  use_for_training: false
   weight: 0.2
   frames_per_video: 4
   people_per_batch: 16
@@ -94,13 +82,9 @@ whale:
 
 wildlife_subsets:
   - subset_dataset: 'AerialCattle2017'
-    eval_tasks:
-      - query_source: 'val'
-        query_modality: 'video'
-        gallery_source: 'val'
-        gallery_modality: 'video'
+    eval_tasks: []
     mini_eval_tasks: []
-    use_for_training: true
+    use_for_training: false
     weight: 0.2
     frames_per_video: 4
     people_per_batch: 16
@@ -110,7 +94,7 @@ wildlife_subsets:
   - subset_dataset: 'ATRW'
     eval_tasks: []
     mini_eval_tasks: []
-    use_for_training: true
+    use_for_training: false
     weight: 0.2
     frames_per_video: 4
     people_per_batch: 16
@@ -118,17 +102,9 @@ wildlife_subsets:
     min_num_images: 8
 
   - subset_dataset: 'CatIndividualImages'
-    eval_tasks:
-      - query_source: 'val'
-        query_modality: 'frame'
-        gallery_source: 'val'
-        gallery_modality: 'frame'
-    mini_eval_tasks:
-      - query_source: 'val'
-        query_modality: 'frame'
-        gallery_source: 'val'
-        gallery_modality: 'frame'
-    use_for_training: true
+    eval_tasks: []
+    mini_eval_tasks: []
+    use_for_training: false
     weight: 0.2
     frames_per_video: 4
     people_per_batch: 16
@@ -138,7 +114,7 @@ wildlife_subsets:
   - subset_dataset: 'DogFaceNet'
     eval_tasks: []
     mini_eval_tasks: []
-    use_for_training: true
+    use_for_training: false
     weight: 0.2
     frames_per_video: 4
     people_per_batch: 16
@@ -146,13 +122,9 @@ wildlife_subsets:
     min_num_images: 8
 
   - subset_dataset: 'SeaTurtleID2022'
-    eval_tasks:
-      - query_source: 'val'
-        query_modality: 'video'
-        gallery_source: 'val'
-        gallery_modality: 'video'
+    eval_tasks: []
     mini_eval_tasks: []
-    use_for_training: true
+    use_for_training: false
     weight: 0.2
     frames_per_video: 4
     people_per_batch: 16
@@ -162,7 +134,7 @@ wildlife_subsets:
   - subset_dataset: 'NyalaData'
     eval_tasks: []
     mini_eval_tasks: []
-    use_for_training: true
+    use_for_training: false
     weight: 0.2
     frames_per_video: 4
     people_per_batch: 16
@@ -171,13 +143,9 @@ wildlife_subsets:
 
   # Test extrapolation by not training but doing eval
   - subset_dataset: 'CZoo'
-    eval_tasks:
-      - query_source: 'val'
-        query_modality: 'frame'
-        gallery_source: 'val'
-        gallery_modality: 'frame'
+    eval_tasks: []
     mini_eval_tasks: []
-    use_for_training: true
+    use_for_training: false
     weight: 0.2
     frames_per_video: 4
     people_per_batch: 16
@@ -185,17 +153,9 @@ wildlife_subsets:
     min_num_images: 8
 
 veri:
-  eval_tasks:
-    - query_source: 'query'
-      query_modality: 'frame'
-      gallery_source: 'gallery'
-      gallery_modality: 'video'
-  mini_eval_tasks:
-    - query_source: 'query'
-      query_modality: 'frame'
-      gallery_source: 'gallery'
-      gallery_modality: 'video'
-  use_for_training: true
+  eval_tasks: []
+  mini_eval_tasks: []
+  use_for_training: false
   weight: 1.0
   frames_per_video: 8
   people_per_batch: 16
@@ -207,22 +167,20 @@ vrai:
   mini_eval_tasks: []
   use_for_training: false
 
-
-unsupervised_subsets:
-  - subset_dataset: 'cityscapes'
-    use_for_training: true
-    weight: 1.0
-    frames_per_video: 8
-    people_per_batch: 8
-    views_per_person: 2
-    warn_skipped_identities: false
-    num_hard_negatives_per_positive: 1
-
-  - subset_dataset: 'house_tours'
-    use_for_training: true
-    weight: 1.0
-    frames_per_video: 8
-    people_per_batch: 8
-    views_per_person: 2
-    warn_skipped_identities: false
-    num_hard_negatives_per_positive: 1
+hypersim:
+  eval_tasks:
+    - query_source: 'query'
+      query_modality: 'video'
+      gallery_source: 'gallery'
+      gallery_modality: 'video'
+  mini_eval_tasks:
+    - query_source: 'query'
+      query_modality: 'video'
+      gallery_source: 'gallery'
+      gallery_modality: 'video'
+  use_for_training: true
+  weight: 1.0
+  frames_per_video: 8
+  people_per_batch: 8
+  views_per_person: 2
+  val_split_ratio: 0.1

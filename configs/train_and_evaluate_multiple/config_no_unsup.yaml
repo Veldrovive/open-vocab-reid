@@ -23,7 +23,7 @@ mini_eval_max_frame_embeddings: 1
 eval_batch_size: 16
 
 wandb_project: "open-vocab-mot-tests"
-wandb_name: "higher-contrast-dim"
+wandb_name: "low-dino-dim"
 wandb_entity: null
 no_wandb: false
 run_initial_mini_eval: true
@@ -206,23 +206,3 @@ vrai:
   eval_tasks: []
   mini_eval_tasks: []
   use_for_training: false
-
-
-unsupervised_subsets:
-  - subset_dataset: 'cityscapes'
-    use_for_training: true
-    weight: 1.0
-    frames_per_video: 8
-    people_per_batch: 8
-    views_per_person: 2
-    warn_skipped_identities: false
-    num_hard_negatives_per_positive: 1
-
-  - subset_dataset: 'house_tours'
-    use_for_training: true
-    weight: 1.0
-    frames_per_video: 8
-    people_per_batch: 8
-    views_per_person: 2
-    warn_skipped_identities: false
-    num_hard_negatives_per_positive: 1

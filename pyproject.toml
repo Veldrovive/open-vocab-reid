@@ -22,6 +22,9 @@ dependencies = [
     "kaggle==1.8.4",
     "kagglehub>=1.0.1",
     "kagglesdk==0.1.22",
+    "fiftyone>=1.16.0",
+    "fiftyone-brain>=0.21.6",
+    "umap-learn>=0.5.12",
 ]
 
 [build-system]

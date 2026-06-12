@@ -3,7 +3,7 @@
 """
 Example run command:
 export CUDA_VISIBLE_DEVICES=2,3
-uv run accelerate launch --multi_gpu --num_processes=2 scripts/train_and_evaluate_multiple_parallel.py
+uv run accelerate launch --multi_gpu --num_processes=2 scripts/train_and_evaluate_multiple_parallel.py --config-name config_no_unsup_hypersim
 
 export CUDA_VISIBLE_DEVICES=0
 uv run accelerate launch scripts/train_and_evaluate_multiple_parallel.py
@@ -79,6 +79,8 @@ from open_vocab_mot.data import (
     Wildlife10kSubsetDatasetConfig,
     VeRiDatasetConfig,
     VRAIDatasetConfig,
+    UnsupervisedDatasetConfig,
+    HypersimDatasetConfig,
     load_dataset_for_training,
     load_dataset_for_eval
 )
@@ -271,6 +273,7 @@ class TrainConfig(BaseModel):
     seed: int = 42
     dino_checkpoint: str = "facebook/dinov3-vitl16-pretrain-lvd1689m"
     dino_batch_split: int = 1
+    dino_img_dimension: int = 1024
 
     device: str = "cuda"
     cuda_visible_devices: Optional[str] = None
@@ -311,6 +314,8 @@ class TrainConfig(BaseModel):
     wildlife_subsets: list[Wildlife10kSubsetDatasetConfig] = Field(default_factory=list)
     veri: VeRiDatasetConfig = Field(default_factory=VeRiDatasetConfig)
     vrai: VRAIDatasetConfig = Field(default_factory=VRAIDatasetConfig)
+    unsupervised_subsets: list[UnsupervisedDatasetConfig] = Field(default_factory=list)
+    hypersim: HypersimDatasetConfig = Field(default_factory=HypersimDatasetConfig)
 
 
 class CombinedIterableDataset(IterableDataset):
@@ -497,6 +502,7 @@ def run_mini_evaluation(epoch, args, model, dino_harness, criterion, device, acc
         eval_configs.append((subset_cfg.subset_dataset, subset_cfg, "wildlife10k_subset"))
     eval_configs.append(("veri", args.veri, "veri"))
     eval_configs.append(("vrai", args.vrai, "vrai"))
+    eval_configs.append(("hypersim", args.hypersim, "hypersim"))
     
     for name, cfg, dtype in eval_configs:
         tasks = cfg.mini_eval_tasks
@@ -669,6 +675,21 @@ def main(cfg: DictConfig):
             )
             wildlife_iterables[subset_name] = subset_iterable
             
+    unsupervised_iterables = {}
+    for subset_cfg in args.unsupervised_subsets:
+        if subset_cfg.use_for_training:
+            subset_name = subset_cfg.subset_dataset
+            if accelerator.is_main_process:
+                print(f"Loading Unsupervised subset {subset_name} for training...")
+            subset_iterable = load_dataset_for_training(
+                dataset_type="unsupervised",
+                config=subset_cfg,
+                seed=args.seed + 5 + len(unsupervised_iterables) + accelerator.process_index * 100,
+                verbose=accelerator.is_main_process,
+                transform=transform
+            )
+            unsupervised_iterables[subset_name] = subset_iterable
+
     veri_iterable = None
     if args.veri.use_for_training:
         if accelerator.is_main_process:
@@ -692,6 +713,18 @@ def main(cfg: DictConfig):
             verbose=accelerator.is_main_process,
             transform=transform
         )
+        
+    hypersim_iterable = None
+    if args.hypersim.use_for_training:
+        if accelerator.is_main_process:
+            print("Loading Hypersim dataset for training...")
+        hypersim_iterable = load_dataset_for_training(
+            dataset_type="hypersim",
+            config=args.hypersim,
+            seed=args.seed + 5 + len(wildlife_iterables) + accelerator.process_index * 100,
+            verbose=accelerator.is_main_process,
+            transform=transform
+        )
     
     if accelerator.is_main_process:
         print("Loading Compiled DINO Harness...")
@@ -700,7 +733,7 @@ def main(cfg: DictConfig):
         checkpoint=args.dino_checkpoint,
         device=device,
         dtype=torch.bfloat16,
-        max_side_len=1024,
+        max_side_len=args.dino_img_dimension,
         warmup=False
     )
     
@@ -756,6 +789,13 @@ def main(cfg: DictConfig):
             dataset_names.append(subset_name)
             weights.append(subset_cfg.weight)
             
+    for subset_cfg in args.unsupervised_subsets:
+        subset_name = subset_cfg.subset_dataset
+        if subset_name in unsupervised_iterables:
+            datasets.append(unsupervised_iterables[subset_name])
+            dataset_names.append(subset_name)
+            weights.append(subset_cfg.weight)
+            
     if veri_iterable is not None:
         datasets.append(veri_iterable)
         dataset_names.append("veri")
@@ -765,6 +805,11 @@ def main(cfg: DictConfig):
         datasets.append(vrai_iterable)
         dataset_names.append("vrai")
         weights.append(args.vrai.weight)
+        
+    if hypersim_iterable is not None:
+        datasets.append(hypersim_iterable)
+        dataset_names.append("hypersim")
+        weights.append(args.hypersim.weight)
             
     if not datasets:
         raise ValueError("No datasets enabled for training. Set at least one dataset's 'use' flag to True.")
@@ -892,6 +937,14 @@ def main(cfg: DictConfig):
 
         run_mini_evaluation(epoch, args, model, dino_harness, criterion, device, accelerator, eval_datasets_cache)
         model.train()
+        
+        if accelerator.is_main_process:
+            base_path = Path(args.checkpoint_path)
+            epoch_checkpoint_path = base_path.parent / f"{base_path.stem}_epoch_{epoch+1}{base_path.suffix}"
+            print(f"Saving model checkpoint for epoch {epoch+1} to {epoch_checkpoint_path}...")
+            unwrapped_model = accelerator.unwrap_model(model)
+            torch.save(unwrapped_model.state_dict(), epoch_checkpoint_path)
+            print("Epoch checkpoint saved.")
 
     if accelerator.is_main_process:
         print("\nTraining completed.")

@@ -2,6 +2,7 @@ dat/
 wandb/
 weights/
 outputs/
+*_cache/
 
 .env
 
