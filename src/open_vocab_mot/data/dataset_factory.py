@@ -65,6 +65,7 @@ class HypersimDatasetConfig(DatasetConfig):
     num_hard_negatives_per_positive: int = 1
     val_split_ratio: float = 0.1
     split_seed: int = 42
+    crop_to_object: bool = True
 
 class UnsupervisedDatasetConfig(DatasetConfig):
     subset_dataset: str
@@ -80,7 +81,7 @@ def load_dataset_for_training(
     transform: Any | None = None
 ) -> VideoReIDKPFBatchIterableDataset | UnsupervisedBatchIterableDataset | HypersimBatchIterableDataset:
     
-    kwargs = config.model_dump(exclude={"use_for_training", "weight", "frames_per_video", "people_per_batch", "views_per_person", "eval_tasks", "mini_eval_tasks", "subset_dataset", "min_num_images", "warn_skipped_identities", "num_hard_negatives_per_positive", "val_split_ratio", "split_seed"}, exclude_unset=True, exclude_none=True)
+    kwargs = config.model_dump(exclude={"use_for_training", "weight", "frames_per_video", "people_per_batch", "views_per_person", "eval_tasks", "mini_eval_tasks", "subset_dataset", "min_num_images", "warn_skipped_identities", "num_hard_negatives_per_positive", "val_split_ratio", "split_seed"}, exclude_none=True)
     
     if dataset_type == "duke":
         ds = DukeMTMCVideoDataset(
@@ -218,7 +219,7 @@ def load_dataset_for_eval(
     config: DatasetConfig,
     verbose: bool = False
 ) -> Dict[str, AbstractVideoReIDDataset]:
-    kwargs = config.model_dump(exclude={"use_for_training", "weight", "frames_per_video", "people_per_batch", "views_per_person", "eval_tasks", "mini_eval_tasks", "subset_dataset", "min_num_images", "val_split_ratio", "split_seed"}, exclude_unset=True, exclude_none=True)
+    kwargs = config.model_dump(exclude={"use_for_training", "weight", "frames_per_video", "people_per_batch", "views_per_person", "eval_tasks", "mini_eval_tasks", "subset_dataset", "min_num_images", "warn_skipped_identities", "num_hard_negatives_per_positive", "val_split_ratio", "split_seed"})
     
     if dataset_type == "duke":
         query_ds = DukeMTMCVideoDataset(

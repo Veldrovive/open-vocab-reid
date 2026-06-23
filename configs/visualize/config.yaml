@@ -1,0 +1,49 @@
+checkpoint_path: "weights/reid_transformer_latest_epoch_5.pt"
+cuda_visible_devices: null
+
+duke:
+  enable: false
+  input_set: "query"
+  grouping_mode: "existing"
+  frames_per_video: 8
+
+whale:
+  enable: false
+  input_set: "val"
+  grouping_mode: "existing"
+  frames_per_video: 8
+
+veri:
+  enable: false
+  input_set: "query"
+  grouping_mode: "existing"
+  frames_per_video: 8
+
+vrai:
+  enable: false
+  input_set: "query"
+  grouping_mode: "existing"
+  frames_per_video: 8
+
+hypersim:
+  enable: true
+  input_set: "val"
+  grouping_mode: "split_sequence"
+  frames_per_video: 8
+  max_identities: 50
+
+use_nested_tensors: false
+frame_transformer_dim: 1024
+frame_contrastive_dim: 512
+frame_num_heads: 8
+frame_num_layers: 5
+video_transformer_dim: 512
+video_contrastive_dim: 512
+video_num_heads: 4
+video_num_layers: 3
+dropout: 0.01
+
+extract_video_embeddings: true
+extract_frame_embeddings: false
+include_masks: true
+recompute: false
